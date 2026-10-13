@@ -1,3 +1,7 @@
+# Mine-imator Suite + Import for Blender 0.3.Fix1
+Native mineimator shapes are now imported (but with a bad parenting thing or something)
+
+
 # Mine-imator Suite + Import for Blender 0.3.6
 
 Imports the frame-zero static state of Mine-imator 2.0.2 format-34 projects
