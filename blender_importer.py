@@ -119,6 +119,49 @@ class ImportReport:
         return "\n".join(lines)
 
 
+def _use_hashed_alpha(material: bpy.types.Material) -> None:
+    """Mine-imator's alpha hashing: a fragment with 0 < alpha < 1 is discarded when
+    alpha < hash(position, sample), otherwise it becomes fully opaque and writes
+    depth.  Blender's Dithered (EEVEE Next) / Hashed (older EEVEE) is the same
+    technique, so overlapping translucent shapes never need sorting."""
+    if hasattr(material, "surface_render_method"):
+        material.surface_render_method = "DITHERED"
+    try:
+        material.blend_method = "HASHED"
+        material.shadow_method = "HASHED"
+    except Exception:
+        pass
+
+
+def _apply_color_nodes(material: bpy.types.Material, tint: tuple[float, float, float],
+                       mix: tuple[float, float, float], mix_percent: float) -> None:
+    """Multiply the texture by `tint`, then blend toward `mix` (linear colours)."""
+    nodes, links = material.node_tree.nodes, material.node_tree.links
+    principled = nodes.get("Principled BSDF")
+    tex_node = next((node for node in nodes if node.type == "TEX_IMAGE"), None)
+    if tex_node is None or principled is None:
+        return
+    try:
+        socket = tex_node.outputs["Color"]
+        if tint != scenemath.WHITE:
+            node = nodes.new("ShaderNodeMixRGB")
+            node.blend_type = "MULTIPLY"
+            node.inputs[0].default_value = 1.0
+            node.inputs[2].default_value = (*tint, 1.0)
+            links.new(socket, node.inputs[1])
+            socket = node.outputs["Color"]
+        if mix_percent > 1e-4:
+            node = nodes.new("ShaderNodeMixRGB")
+            node.blend_type = "MIX"
+            node.inputs[0].default_value = mix_percent
+            node.inputs[2].default_value = (*mix, 1.0)
+            links.new(socket, node.inputs[1])
+            socket = node.outputs["Color"]
+        links.new(socket, principled.inputs["Base Color"])
+    except Exception:
+        pass
+
+
 def _hex_color(value: Any, alpha: float = 1.0) -> tuple[float, float, float, float]:
     raw = str(value or "#FFFFFF").lstrip("#")
     if len(raw) == 8:
@@ -274,12 +317,20 @@ def _new_material(name: str, image_path: Path | None = None, color: tuple[float,
             texture.image = image
             texture.interpolation = "Closest"
             links.new(texture.outputs["Color"], principled.inputs["Base Color"])
-            links.new(texture.outputs["Alpha"], principled.inputs["Alpha"])
+            if color[3] < 1.0:
+                # color_alpha / ALPHA scale the texture's own alpha; linking the
+                # texture alone silently threw the shape's alpha away.
+                scale = nodes.new("ShaderNodeMath")
+                scale.operation = "MULTIPLY"
+                scale.inputs[1].default_value = color[3]
+                links.new(texture.outputs["Alpha"], scale.inputs[0])
+                links.new(scale.outputs[0], principled.inputs["Alpha"])
+            else:
+                links.new(texture.outputs["Alpha"], principled.inputs["Alpha"])
             material.diffuse_color = (1, 1, 1, color[3])
         except Exception:
             pass
-    if hasattr(material, "surface_render_method"):
-        material.surface_render_method = "DITHERED"
+    _use_hashed_alpha(material)
     if hasattr(material, "use_transparency_overlap"):
         material.use_transparency_overlap = False
     material["mi_pixel_art"] = True
@@ -533,19 +584,13 @@ def _import_meshcache_world(
 
 
 def _placeholder(name: str, message: str, collection: bpy.types.Collection, project: core.ProjectIndex, timeline: dict[str, Any], report: ImportReport) -> bpy.types.Object:
-    size = 0.5
-    vertices = [
-        (-size, -size, -size), (size, -size, -size), (size, size, -size), (-size, size, -size),
-        (-size, -size, size), (size, -size, size), (size, size, size), (-size, size, size),
-    ]
-    faces = [(0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (4, 0, 3, 7)]
+    # A single vertex: it keeps the hierarchy and transform for whatever hangs off
+    # a missing resource, but draws nothing (the old cube sat in front of the rig).
     mesh = bpy.data.meshes.new(f"{name} Placeholder Mesh")
-    mesh.from_pydata(vertices, [], faces)
+    mesh.from_pydata([(0.0, 0.0, 0.0)], [], [])
     obj = bpy.data.objects.new(f"MISSING - {name}", mesh)
     collection.objects.link(obj)
-    obj.data.materials.append(_new_material("MI Missing Resource", color=(1.0, 0.0, 1.0, 1.0)))
     obj["mi_placeholder_reason"] = message
-    obj.show_name = True
     _apply_transform(obj, core.frame0_state(timeline))
     _metadata(obj, project, timeline)
     report.placeholders.append(f"{name}: {message}")
@@ -665,10 +710,60 @@ def _mcprep_texture(name: str) -> Path | None:
     return None
 
 
-def _create_model_shape(name: str, shape: dict[str, Any], texture_size: tuple[float, float], material: bpy.types.Material, collection: bpy.types.Collection) -> bpy.types.Object:
+_ALPHA_CACHE: dict[str, tuple[tuple[int, int], Any]] = {}
+
+
+def _image_alpha(path: Path) -> tuple[tuple[int, int], Any]:
+    """((width, height), opaque(px, py)) for a texture, (0, 0) = top left.
+
+    Mine-imator treats a pixel as solid only when its alpha is exactly 1.
+    """
+    key = str(path)
+    cached = _ALPHA_CACHE.get(key)
+    if cached is None:
+        image = bpy.data.images.load(key, check_existing=True)
+        width, height = int(image.size[0]), int(image.size[1])
+        try:
+            import numpy as np
+            buffer = np.empty(width * height * 4, dtype=np.float32)
+            image.pixels.foreach_get(buffer)
+            alpha = buffer.reshape(height, width, 4)[::-1, :, 3]  # Blender is bottom-up
+            alpha = alpha >= 0.999
+        except Exception:
+            flat = list(image.pixels[:])
+            alpha = [[flat[((height - 1 - y) * width + x) * 4 + 3] >= 0.999 for x in range(width)] for y in range(height)]
+
+        def opaque(px: int, py: int, _a=alpha, _w=width, _h=height) -> bool:
+            return 0 <= px < _w and 0 <= py < _h and bool(_a[py][px])
+
+        cached = ((width, height), opaque)
+        _ALPHA_CACHE[key] = cached
+    return cached
+
+
+def _voxel_plane_geometry(shape: dict[str, Any], texture_size: tuple[float, float], texture_path: Path):
+    """model_shape_generate_plane_3d: one cube per opaque texel, nothing else."""
+    size, opaque = _image_alpha(texture_path)
+    plane = modelgeom.plane3d_geometry(shape, texture_size, size, opaque, core.mi_vector)
+    return plane.vertices, plane.faces, plane.loop_uvs, plane.voxels
+
+
+def _create_model_shape(name: str, shape: dict[str, Any], texture_size: tuple[float, float], material: bpy.types.Material, collection: bpy.types.Collection, texture_path: Path | None = None) -> bpy.types.Object:
     shape_type = str(shape.get("type", "block")).lower()
-    geometry = _plane_geometry(shape, texture_size) if shape_type == "plane" else _box_geometry(shape, texture_size)
-    vertices, faces, uvs = geometry
+    texture_size = (max(texture_size), max(texture_size))  # model_file_load_part makes it square
+    voxels = None
+    if shape_type == "plane" and shape.get("3d") and texture_path is not None and texture_path.is_file():
+        try:
+            vertices, faces, uvs, voxels = _voxel_plane_geometry(shape, texture_size, texture_path)
+        except Exception:
+            voxels = None
+    if voxels is None:
+        geometry = _plane_geometry(shape, texture_size) if shape_type == "plane" else _box_geometry(shape, texture_size)
+        vertices, faces, uvs = geometry
+        if shape_type != "plane" and shape.get("invert", False):
+            # Inside-out block (e.g. a mouth cavity): reverse every face and its UVs.
+            faces = [tuple(reversed(face)) for face in faces]
+            uvs = [uv for start in range(0, len(uvs), 4) for uv in reversed(uvs[start:start + 4])]
     mesh = bpy.data.meshes.new(f"{name} Mesh")
     mesh.from_pydata(vertices, [], faces)
     mesh.materials.append(material)
@@ -683,6 +778,9 @@ def _create_model_shape(name: str, shape: dict[str, Any], texture_size: tuple[fl
     scale = list(shape.get("scale", [1, 1, 1]))
     while len(scale) < 3: scale.append(1)
     obj.matrix_basis = _transform_matrix(location, rotation, (float(scale[0]), float(scale[2]), float(scale[1])))
+    obj["mi_shape_type"] = shape_type
+    if voxels is not None:
+        obj["mi_3d_plane_voxels"] = voxels
     return obj
 
 
@@ -819,17 +917,50 @@ def _build_mimodel(model: dict[str, Any], model_path: Path | None, root: bpy.typ
         base_size = [64, 64]
     material_cache: dict[str, bpy.types.Material] = {}
 
-    def texture_path_for(texture: Any) -> Path | None:
-        return texture_override or _resolve_texture(texture, model_path.parent if model_path else None, project, assets)
+    def texture_path_for(texture: Any, explicit: bool = False) -> Path | None:
+        """The template's model texture replaces only the model's *default* texture;
+        a part or shape that names its own texture (e.g. a ponytail) keeps it."""
+        if texture_override and not explicit:
+            return texture_override
+        resolved = _resolve_texture(texture, model_path.parent if model_path else None, project, assets)
+        return resolved or texture_override
 
-    def material_for(texture: Any, color: Any, alpha: float) -> bpy.types.Material:
-        texture_path = texture_path_for(texture)
-        key = f"{texture_path}|{color}|{alpha}"
+    def material_for(texture_path: Path | None, blend: tuple[float, float, float], alpha: float,
+                     mix: tuple[float, float, float], mix_percent: float, cull: bool = False) -> bpy.types.Material:
+        key = f"{texture_path}|{blend}|{alpha}|{mix}|{mix_percent}|{cull}"
         if key not in material_cache:
-            material_cache[key] = _new_material(f"MI {Path(str(texture_path)).stem if texture_path else 'Color'}", texture_path, _hex_color(color, alpha))
+            tint = scenemath.color_linear(blend)
+            mix_lin = scenemath.color_linear(mix)
+            if texture_path:
+                base = (1.0, 1.0, 1.0, alpha)
+            else:
+                base = tuple(c * (1 - mix_percent) + m * mix_percent for c, m in zip(tint, mix_lin)) + (alpha,)
+            material = _new_material(f"MI {Path(str(texture_path)).stem if texture_path else 'Color'}", texture_path, base)
+            if texture_path:
+                _apply_color_nodes(material, tint, mix_lin, mix_percent)
+            material.use_backface_culling = cull   # inverted blocks must only show from inside
+            material_cache[key] = material
         return material_cache[key]
 
-    def visit(parts: list[dict[str, Any]], parent: bpy.types.Object, inherited_texture: Any, inherited_size: list[float], path: str) -> None:
+    ColorState = tuple  # (blend rgb, alpha, mix rgb, mix percent)
+
+    def color_state(node: dict[str, Any], parent: ColorState) -> ColorState:
+        """model_file_load_part / _shape: color_blend multiplies, alpha multiplies,
+        color_mix adds and color_mix_percent adds (clamped) when color_inherit."""
+        blend = scenemath.parse_hex(node.get("color_blend"))
+        legacy = scenemath.parse_hex(node.get("color"))
+        blend = tuple(a * b for a, b in zip(blend, legacy))
+        alpha = float(node.get("color_alpha", 1.0))
+        mix = scenemath.parse_hex(node.get("color_mix"), scenemath.BLACK)
+        percent = float(node.get("color_mix_percent", 0.0))
+        if bool(node.get("color_inherit", True)):
+            blend = tuple(a * b for a, b in zip(blend, parent[0]))
+            alpha *= parent[1]
+            mix = tuple(min(1.0, a + b) for a, b in zip(mix, parent[2]))
+            percent = min(1.0, max(0.0, percent + parent[3]))
+        return (blend, alpha, mix, percent)
+
+    def visit(parts: list[dict[str, Any]], parent: bpy.types.Object, inherited_texture: Any, inherited_size: list[float], path: str, inherited_color: ColorState, inherited_explicit: bool = False) -> None:
         for part_index, part in enumerate(parts):
             part_name = str(part.get("name") or f"part_{part_index}")
             pivot = _new_empty(part_name, collection)
@@ -841,21 +972,25 @@ def _build_mimodel(model: dict[str, Any], model_path: Path | None, root: bpy.typ
             pivot.matrix_basis = _transform_matrix(location, rotation, (scale[0], scale[2], scale[1]))
             pivot["mi_model_part"] = part_name
             pivot["mi_model_part_path"] = f"{path}/{part_name}"
+            pivot["mi_lock_bend"] = bool(part.get("lock_bend", True))
+            pivot["mi_render_depth"] = int(part.get("depth", 0) or 0)
             bend = part.get("bend")
             if bend:
                 pivot["mi_bend_definition"] = json.dumps(bend, separators=(",", ":"))
             part_map[part_name].append(pivot)
             part_texture = part.get("texture", inherited_texture)
+            part_explicit = inherited_explicit or ("texture" in part)
             part_size = part.get("texture_size", inherited_size)
             if not isinstance(part_size, list) or len(part_size) < 2:
                 part_size = inherited_size
+            part_color = color_state(part, inherited_color)
             for shape_index, shape in enumerate(part.get("shapes", [])):
                 shape_name = str(shape.get("description") or f"{part_name}_shape_{shape_index + 1}")
-                alpha = float(shape.get("color_alpha", 1.0))
+                blend, alpha, mix, mix_percent = color_state(shape, part_color)
                 texture = shape.get("texture", part_texture)
                 shape_size = shape.get("texture_size", part_size)
-                material = material_for(texture, shape.get("color", "#FFFFFF"), alpha)
-                texture_path = texture_path_for(texture)
+                texture_path = texture_path_for(texture, part_explicit or ("texture" in shape))
+                material = material_for(texture_path, blend, alpha, mix, mix_percent, bool(shape.get("invert", False)) and str(shape.get("type", "block")).lower() != "plane")
                 voxelize = (
                     outer_layers_3d
                     and bool(model.get("player_skin"))
@@ -868,16 +1003,19 @@ def _build_mimodel(model: dict[str, Any], model_path: Path | None, root: bpy.typ
                     report.created["3d_outer_layer"] += 1
                     report.created["3d_outer_pixel"] += int(obj.get("mi_3d_outer_pixels", 0))
                 else:
-                    obj = _create_model_shape(shape_name, shape, tuple(shape_size[:2]), material, collection)
+                    obj = _create_model_shape(shape_name, shape, tuple(shape_size[:2]), material, collection, texture_path)
                     if outer_layers_3d and bool(model.get("player_skin")) and float(shape.get("inflate", 0.0)) > 0.0 and texture_path is None:
                         report.fallbacks.append(f"{root.name}/{shape_name}: 3D outer layer needs a readable skin texture; kept the flat layer")
                 obj.parent = pivot
                 obj.hide_render = alpha <= 0
                 report.created[f"model_{str(shape.get('type', 'block')).lower()}"] += 1
-            visit(part.get("parts", []), pivot, part_texture, part_size, f"{path}/{part_name}")
+                if obj.get("mi_3d_plane_voxels") is not None:
+                    report.created["model_3d_plane"] += 1
+                    report.created["model_3d_plane_voxel"] += int(obj["mi_3d_plane_voxels"])
+            visit(part.get("parts", []), pivot, part_texture, part_size, f"{path}/{part_name}", part_color, part_explicit)
 
     _PLANE_WARNINGS.clear()
-    visit(model.get("parts", []), root, model.get("texture", "default"), base_size, "")
+    visit(model.get("parts", []), root, model.get("texture", "default"), base_size, "", ((1.0, 1.0, 1.0), 1.0, (0.0, 0.0, 0.0), 0.0))
     for warning in sorted(set(_PLANE_WARNINGS)):
         report.fallbacks.append(f"{root.name}: {warning}")
     _PLANE_WARNINGS.clear()
@@ -905,7 +1043,8 @@ def _world_matrix(obj: bpy.types.Object) -> Matrix:
 
 
 def _slice_and_weight(child: bpy.types.Object, spec: "modelgeom.BendSpec", pivot: Vector, axis_vec: Vector,
-                      axis_index: int, note) -> bool:
+                      axis_index: int, note, eased: bool = False, rotation: Matrix | None = None,
+                      rotation_pivot: Vector | None = None) -> bool:
     """Slice a shape across the bend region and give it a bend vertex group.
 
     Returns True when at least one vertex is influenced by the bend.
@@ -940,10 +1079,27 @@ def _slice_and_weight(child: bpy.types.Object, spec: "modelgeom.BendSpec", pivot
         bm.to_mesh(mesh)
         bm.free()
         mesh.update()
-    weights = [(vertex.index, spec.weight((matrix @ vertex.co)[axis_index])) for vertex in mesh.vertices]
+    weights = [(vertex.index, spec.weight((matrix @ vertex.co)[axis_index], eased)) for vertex in mesh.vertices]
     influenced = [(index, weight) for index, weight in weights if weight > 1e-6]
     if not influenced:
         return False
+    if rotation is not None and rotation_pivot is not None:
+        # Guard: linear blend skinning moves a vertex by at most |R - I| times its distance
+        # from the pivot.  If that is out of proportion to the shape, leave it unbent.
+        points = [matrix @ vertex.co for vertex in mesh.vertices]
+        lows = [min(p[i] for p in points) for i in range(3)]
+        highs = [max(p[i] for p in points) for i in range(3)]
+        diagonal = math.sqrt(sum((highs[i] - lows[i]) ** 2 for i in range(3)))
+        weight_of = dict(influenced)
+        worst = 0.0
+        for vertex, point in zip(mesh.vertices, points):
+            w = weight_of.get(vertex.index, 0.0)
+            if w > 0.0:
+                moved = rotation_pivot + rotation @ (point - rotation_pivot)
+                worst = max(worst, w * (moved - point).length)
+        if not math.isfinite(worst) or worst > 2.0 * diagonal + 0.25:
+            note(f"bend on {child.name} would move it {worst:.2f} blocks (shape is {diagonal:.2f}); left unbent")
+            return False
     group = child.vertex_groups.get(BEND_BONE_NAME) or child.vertex_groups.new(name=BEND_BONE_NAME)
     for index, weight in influenced:
         group.add([index], min(1.0, weight), "REPLACE")
@@ -996,6 +1152,8 @@ def _make_bend_rig(part_obj: bpy.types.Object, meshes: list[bpy.types.Object], p
         modifier.object = arm_obj
         modifier.use_vertex_groups = True
     arm_obj["mi_bend_part"] = label
+    arm_obj["mi_bend_pivot"] = [float(c) for c in pivot]
+    arm_obj["mi_bend_rotation"] = [[float(c) for c in row] for row in rotation.to_3x3()]
     return arm_obj
 
 
@@ -1035,19 +1193,26 @@ def _apply_model_bend(part_obj: bpy.types.Object, state: dict[str, Any], report:
             report.fallbacks.append(f"{part_label}: {message}")
 
     full_rotation = Matrix(spec.bone_rotation(angles))
+    eased = modelgeom.BendSpec.uses_easing(angles)  # model_shape_get_bend: X/Y eased, Z linear
     rigged: list[bpy.types.Object] = []
     for child in list(part_obj.children):
         if child.type == "MESH":
             try:
-                if _slice_and_weight(child, spec, pivot, axis_vec, axis_index, note):
+                # Planes are sliced along Z even for front/back bends.
+                use_spec = spec.plane_variant() if child.get("mi_shape_type") == "plane" else spec
+                use_axis, use_pivot_value, _ = use_spec.axis_and_pivot()
+                use_pivot = Vector((0.0, 0.0, 0.0))
+                use_pivot[use_axis] = use_pivot_value
+                use_axis_vec = Vector((0.0, 0.0, 0.0))
+                use_axis_vec[use_axis] = 1.0
+                if _slice_and_weight(child, use_spec, use_pivot, use_axis_vec, use_axis, note, eased, full_rotation, pivot):
                     rigged.append(child)
             except Exception as exc:
                 note(f"bend weights failed on {child.name} ({type(exc).__name__}: {exc})")
         elif child.type == "EMPTY":
-            weight = spec.weight(child.location[axis_index])
-            if weight > 0.0 and any(abs(value) > 1e-8 for value in angles):
-                rotation = Matrix(modelgeom.weighted_rotation(angles, weight)).to_4x4()
-                child.matrix_basis = Matrix.Translation(pivot) @ rotation @ Matrix.Translation(-pivot) @ child.matrix_basis
+            # Child parts with lock_bend follow the bend by the full angle about the pivot.
+            if child.get("mi_lock_bend", True) and any(abs(value) > 1e-8 for value in angles):
+                child.matrix_basis = Matrix.Translation(pivot) @ full_rotation.to_4x4() @ Matrix.Translation(-pivot) @ child.matrix_basis
     if rigged:
         if _make_bend_rig(part_obj, rigged, pivot, full_rotation, str(part_label), note) is not None and report is not None:
             report.created["bend_rig"] += 1
@@ -1262,6 +1427,7 @@ class SceneImporter:
                 obj = _placeholder(str(label), str(exc), self.collections[category], self.project, timeline, self.report)
                 self.timeline_objects[str(timeline.get("id"))] = obj
         self._apply_parenting()
+        self._audit_world_size()
         if self.report.created.get("bend_rig"):
             self.report.notes.append(f"Bends: {self.report.created['bend_rig']} armature rig(s) ('{BEND_BONE_NAME}' bone) approximate Mine-imator's per-slice bend")
         if any(self.report.created.get(kind) for kind in shapegen.SHAPE_KINDS):
@@ -1307,13 +1473,16 @@ class SceneImporter:
         return obj
 
     def _import_model(self, timeline: dict[str, Any], template: dict[str, Any] | None, collection: bpy.types.Collection,
-                      parent_obj: bpy.types.Object | None = None) -> bpy.types.Object:
+                      parent_obj: bpy.types.Object | None = None, local_prefix: Matrix | None = None) -> bpy.types.Object:
         label = timeline.get("name") or (template or {}).get("name") or str(timeline.get("type", "Model")).title()
 
         def placeholder(message: str) -> bpy.types.Object:
             obj = _placeholder(label, message, collection, self.project, timeline, self.report)
+            if local_prefix is not None:
+                obj.matrix_basis = local_prefix @ obj.matrix_basis
             if parent_obj is not None:
                 self._parent_to(obj, parent_obj, timeline)
+            self._build_stand_in(timeline, obj, collection)
             return obj
 
         if not template:
@@ -1332,6 +1501,8 @@ class SceneImporter:
                 self.report.missing.append(f"{label}: frame-0 texture resource is missing")
         root = _new_empty(label, collection)
         _apply_transform(root, state)
+        if local_prefix is not None:
+            root.matrix_basis = local_prefix @ root.matrix_basis
         _metadata(root, self.project, timeline, template, model_path)
         if parent_obj is not None:
             self._parent_to(root, parent_obj, timeline)
@@ -1384,6 +1555,64 @@ class SceneImporter:
         self.report.created["model_root"] += 1
         return root
 
+    def _audit_world_size(self, max_blocks: float = 3.5, max_distance: float = 14.0) -> None:
+        """List meshes that end up unusually large or far from the origin.
+
+        The report names them (with their local scale), which is the quickest way to
+        pin down a misplaced shape without guessing.
+        """
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            return
+        flagged: list[str] = []
+        for collection in self.collections.values():
+            for obj in collection.all_objects:
+                if obj.type != "MESH" or len(obj.data.vertices) < 2:
+                    continue
+                corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+                lows = [min(c[i] for c in corners) for i in range(3)]
+                highs = [max(c[i] for c in corners) for i in range(3)]
+                size = max(highs[i] - lows[i] for i in range(3))
+                center = [(lows[i] + highs[i]) * 0.5 for i in range(3)]
+                if size > max_blocks or math.sqrt(sum(c * c for c in center)) > max_distance:
+                    scale = obj.matrix_basis.to_scale()
+                    flagged.append(
+                        f"audit: '{obj.name}' (parent '{obj.parent.name if obj.parent else '-'}') spans {size:.1f} blocks at "
+                        f"({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}), local scale ({scale[0]:.3f}, {scale[1]:.3f}, {scale[2]:.3f})"
+                    )
+        self.report.fallbacks.extend(flagged[:15])
+        if len(flagged) > 15:
+            self.report.fallbacks.append(f"audit: ... and {len(flagged) - 15} more oversized/far objects")
+
+    def _build_stand_in(self, timeline: dict[str, Any], root: bpy.types.Object, collection: bpy.types.Collection) -> None:
+        """Keep a missing model's structure so what hangs off it is not lost.
+
+        Its bodyparts become plain empties (frame-0 timeline transform only; the
+        model part's built-in transform is unknown without the file) and every
+        folder, shape and nested model attached to it is still imported.
+        """
+        label = timeline.get("name") or "model"
+        stand_ins: list[tuple[dict[str, Any], bpy.types.Object]] = []
+        queue: list[tuple[dict[str, Any], bpy.types.Object]] = [(timeline, root)]
+        while queue:
+            parent_timeline, parent_obj = queue.pop(0)
+            for child in self.project.children(str(parent_timeline.get("id"))):
+                if str(child.get("type", "")).lower() != "bodypart":
+                    continue
+                obj = _new_empty(child.get("name") or child.get("model_part_name") or "Part", collection)
+                _apply_transform(obj, core.frame0_state(child))
+                self._parent_to(obj, parent_obj, child)
+                self.timeline_objects[str(child.get("id"))] = obj
+                stand_ins.append((child, obj))
+                queue.append((child, obj))
+        self._attach_children(timeline, root, collection)
+        for bodypart, obj in stand_ins:
+            self._attach_children(bodypart, obj, collection)
+        self.report.fallbacks.append(
+            f"{label}: model file missing; its {len(stand_ins)} body part(s) became empties, attached shapes/folders/models were kept"
+        )
+
     # -- hierarchy helpers ---------------------------------------------------
 
     def _style(self, timeline: dict[str, Any]) -> "scenemath.Style":
@@ -1422,7 +1651,7 @@ class SceneImporter:
                 continue
             label = child.get("name") or child_type or child.get("id")
             try:
-                obj = self._import_attached(child, child_type, category, parent_obj, collection)
+                obj = self._import_attached(child, child_type, category, parent_timeline, parent_obj, collection)
             except Exception as exc:
                 self.report.fallbacks.append(f"{label}: {type(exc).__name__}: {exc}")
                 obj = _placeholder(str(label), str(exc), collection, self.project, child, self.report)
@@ -1434,10 +1663,39 @@ class SceneImporter:
             if child_type not in MODEL_TYPES:  # models attach their own children
                 self._attach_children(child, obj, collection)
 
-    def _import_attached(self, timeline: dict[str, Any], kind: str, category: str, parent_obj: bpy.types.Object,
-                         collection: bpy.types.Collection) -> bpy.types.Object | None:
+    def _child_prefix(self, parent_timeline: dict[str, Any], parent_obj: bpy.types.Object, child: dict[str, Any]) -> Matrix | None:
+        """Matrices tl_update_matrix puts between a parent and a child's own transform.
+
+        * lock_bend child of a bendable bodypart: the parent's bend matrix,
+          T(pivot) @ R(bend), applied even at angle 0 (such children are authored
+          relative to the bend pivot).
+        * pivot: the child uses parent.matrix unless inherit.rot_point is set.
+        """
+        parent_type = str(parent_timeline.get("type", "")).lower()
+        prefix: Matrix | None = None
+        if parent_type == "bodypart" and bool(child.get("lock_bend", True)):
+            raw = parent_obj.get("mi_bend_definition")
+            definition = None
+            if raw:
+                try:
+                    definition = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    definition = None
+            if isinstance(definition, dict):
+                spec = modelgeom.BendSpec.from_definition(definition, core.MI_UNITS_PER_BLOCK)
+                angles = spec.engine_angles(core.frame0_state(parent_timeline))
+                prefix = Matrix(scenemath.lock_bend_matrix(spec, angles))
+        pivot = scenemath.rot_point_prefix(parent_type, parent_timeline, scenemath.Inherit.of(child).rot_point)
+        if pivot is not None:
+            pivot_matrix = Matrix(pivot)
+            prefix = pivot_matrix if prefix is None else prefix @ pivot_matrix
+        return prefix
+
+    def _import_attached(self, timeline: dict[str, Any], kind: str, category: str, parent_timeline: dict[str, Any],
+                         parent_obj: bpy.types.Object, collection: bpy.types.Collection) -> bpy.types.Object | None:
+        prefix = self._child_prefix(parent_timeline, parent_obj, timeline)
         if kind in MODEL_TYPES:
-            return self._import_model(timeline, self.project.template_for_timeline(timeline), collection, parent_obj=parent_obj)
+            return self._import_model(timeline, self.project.template_for_timeline(timeline), collection, parent_obj=parent_obj, local_prefix=prefix)
         if kind in shapegen.SHAPE_KINDS:
             obj = self._import_shape(timeline, kind, collection)
         elif kind == "folder":
@@ -1446,6 +1704,8 @@ class SceneImporter:
             obj = self._import_root(timeline, category)
         if obj is None:
             return None
+        if prefix is not None:
+            obj.matrix_basis = prefix @ obj.matrix_basis
         self._parent_to(obj, parent_obj, timeline)
         self._apply_visibility(obj, self._style(timeline))
         return obj
@@ -1484,7 +1744,7 @@ class SceneImporter:
 
     def _shape_texture(self, timeline: dict[str, Any], template: dict[str, Any] | None, state: dict[str, Any], name: str) -> Path | None:
         override = state.get("TEXTURE_OBJ")
-        if str(override).lower() == "none":
+        if isinstance(override, str) and override.lower() == "none":  # explicit "no texture"
             return None
         resource = self.project.resource(override)
         if resource is None and template:
@@ -1506,48 +1766,18 @@ class SceneImporter:
         material = cache.get(key)
         if material is not None:
             return material
-        red, green, blue = style.rgb_mul
+        tint = scenemath.color_linear(style.rgb_mul)
+        mix_lin = scenemath.color_linear(style.mix_color)
         if texture:
             base = (1.0, 1.0, 1.0, style.alpha)
-        else:  # no texture: bake tint and mix straight into the colour
+        else:  # no texture: bake tint and mix straight into the (linear) colour
             p = style.mix_percent
-            base = tuple(c * (1 - p) + m * p for c, m in zip(style.rgb_mul, style.mix_color)) + (style.alpha,)
+            base = tuple(c * (1 - p) + m * p for c, m in zip(tint, mix_lin)) + (style.alpha,)
         material = _new_material(f"MI {kind.title()}", texture, base)
-        nodes, links = material.node_tree.nodes, material.node_tree.links
-        principled = nodes.get("Principled BSDF")
-        tex_node = next((node for node in nodes if node.type == "TEX_IMAGE"), None)
-        if tex_node is not None and principled is not None:
+        tex_node = next((node for node in material.node_tree.nodes if node.type == "TEX_IMAGE"), None)
+        if tex_node is not None:
             tex_node.interpolation = "Linear" if blur else "Closest"
-            color_socket = tex_node.outputs["Color"]
-            try:
-                if style.rgb_mul != scenemath.WHITE:
-                    tint = nodes.new("ShaderNodeMixRGB")
-                    tint.blend_type = "MULTIPLY"
-                    tint.inputs[0].default_value = 1.0
-                    tint.inputs[2].default_value = (red, green, blue, 1.0)
-                    links.new(color_socket, tint.inputs[1])
-                    color_socket = tint.outputs["Color"]
-                if style.mix_percent > 1e-4:
-                    mix = nodes.new("ShaderNodeMixRGB")
-                    mix.blend_type = "MIX"
-                    mix.inputs[0].default_value = style.mix_percent
-                    mix.inputs[2].default_value = (*style.mix_color, 1.0)
-                    links.new(color_socket, mix.inputs[1])
-                    color_socket = mix.outputs["Color"]
-                links.new(color_socket, principled.inputs["Base Color"])
-                if style.alpha < 1.0:
-                    scale = nodes.new("ShaderNodeMath")
-                    scale.operation = "MULTIPLY"
-                    scale.inputs[1].default_value = style.alpha
-                    links.new(tex_node.outputs["Alpha"], scale.inputs[0])
-                    links.new(scale.outputs[0], principled.inputs["Alpha"])
-            except Exception:
-                pass  # keep the plain textured material
-        if style.alpha < 1.0:
-            if hasattr(material, "surface_render_method"):
-                material.surface_render_method = "BLENDED"
-            elif hasattr(material, "blend_method"):
-                material.blend_method = "BLEND"
+            _apply_color_nodes(material, tint, mix_lin, style.mix_percent)
         material.use_backface_culling = not backfaces
         cache[key] = material
         return material
