@@ -99,7 +99,8 @@ def plane_geometry(
 
     uv_origin = _vec3(shape.get("uv"))[:2]
     ou, ov = uv_origin
-    tex_w, tex_h = float(texture_size[0]), float(texture_size[1])
+    # model_file_load_part: texture_size is made square (max of both axes)
+    tex_w = tex_h = max(float(texture_size[0]), float(texture_size[1]))
     invert = bool(shape.get("invert", False))
     is_3d = bool(shape.get("3d", False))
 
@@ -153,12 +154,19 @@ def plane_geometry(
     # shading) and made the old back-face UVs land on the wrong corners.
     front = [to_mi(u0, v0, n_mid), to_mi(u1, v0, n_mid), to_mi(u1, v1, n_mid), to_mi(u0, v1, n_mid)]
     quad = [px(ou, ov + height), px(ou + width, ov + height), px(ou + width, ov), px(ou, ov)]
-    vertices = list(front)
-    faces = [(0, 1, 2, 3)]
-    uvs = list(quad)
+    if shape.get("texture_mirror", False):  # model_shape_generate_plane: swap left/right points
+        quad = [quad[1], quad[0], quad[3], quad[2]]
+    vertices: list[Vec3] = []
+    faces = []
+    uvs: list[tuple[float, float]] = []
+    if not shape.get("hide_front", False):
+        vertices += front
+        faces.append((0, 1, 2, 3))
+        uvs += quad
     if not shape.get("hide_back", False):
+        base = len(vertices)
         vertices += [front[3], front[2], front[1], front[0]]
-        faces.append((4, 5, 6, 7))
+        faces.append((base, base + 1, base + 2, base + 3))
         # Back corner k is front corner 3-k, so it keeps that corner's UV.
         uvs += [quad[3], quad[2], quad[1], quad[0]]
     if invert:
@@ -174,6 +182,12 @@ def plane_geometry(
 # --------------------------------------------------------------------------
 # Bend math
 # --------------------------------------------------------------------------
+
+def ease_in_out_quint(t: float) -> float:
+    """GameMaker/Mine-imator ease("easeinoutquint")."""
+    t = min(1.0, max(0.0, t))
+    return 16.0 * t ** 5 if t < 0.5 else 1.0 - ((-2.0 * t + 2.0) ** 5) / 2.0
+
 
 def _rot_x(a: float) -> Mat3:
     c, s = math.cos(a), math.sin(a)
@@ -290,8 +304,13 @@ class BendSpec:
             return 0, self.offset, self.part == "right"
         return 1, -self.offset, self.part == "back"
 
-    def weight(self, coord: float) -> float:
-        """0..1 share of the bend rotation a point at `coord` receives."""
+    def weight(self, coord: float, eased: bool = False) -> float:
+        """0..1 share of the bend rotation a point at `coord` receives.
+
+        model_shape_get_bend multiplies the X and Y bend angles by an
+        easeinoutquint curve of this weight and the Z angle linearly, so pass
+        ``eased=True`` when the bend uses X or Y.
+        """
         _, pivot, positive = self.axis_and_pivot()
         if self.size <= EPS:
             inside = coord >= pivot if positive else coord <= pivot
@@ -299,7 +318,20 @@ class BendSpec:
         lo, hi = pivot - self.size * 0.5, pivot + self.size * 0.5
         t = (coord - lo) / (hi - lo)
         t = min(1.0, max(0.0, t))
-        return t if positive else 1.0 - t
+        t = t if positive else 1.0 - t
+        return ease_in_out_quint(t) if eased else t
+
+    @staticmethod
+    def uses_easing(angles: tuple[float, float, float]) -> bool:
+        return abs(angles[0]) > 1e-8 or abs(angles[1]) > 1e-8
+
+    def plane_variant(self) -> "BendSpec":
+        """Planes are flat on engine Y, so model_shape_generate_plane slices them
+        along Z even for front/back bends (reusing the offset as a Z offset)."""
+        if self.part not in ("front", "back"):
+            return self
+        from dataclasses import replace
+        return replace(self, part="upper" if self.part == "front" else "lower")
 
     @property
     def segments(self) -> int:
@@ -324,3 +356,128 @@ class BendSpec:
 
 def weighted_rotation(angles: tuple[float, float, float], weight: float) -> Mat3:
     return engine_rotation(angles[0] * weight, angles[1] * weight, angles[2] * weight)
+
+
+# --------------------------------------------------------------------------
+# 3D planes (model_shape_generate_plane_3d)
+# --------------------------------------------------------------------------
+
+@dataclass
+class Plane3D:
+    vertices: list[Vec3]
+    faces: list[tuple[int, int, int, int]]
+    loop_uvs: list[tuple[float, float]]   # 4 per face, Blender V (bottom = 0)
+    voxels: int = 0
+    sample_size: tuple[int, int] = (0, 0)
+
+
+def plane3d_geometry(
+    shape: dict[str, Any],
+    texture_size: Sequence[float],
+    image_size: tuple[int, int],
+    opaque: Callable[[int, int], bool],
+    to_blender: Callable[[Sequence[float]], Vec3],
+) -> Plane3D:
+    """Voxelize a "3d": true plane exactly like Mine-imator.
+
+    One cube per fully opaque texture pixel, 1 unit thick on the plane's thin
+    (JSON Z) axis.  Only exposed side faces are emitted, and every face of a
+    voxel samples that pixel's own texel, so nothing is stretched.
+
+    ``opaque(px, py)`` answers for absolute image pixels with (0, 0) at the TOP
+    left.  Geometry is unscaled; apply the shape scale on the object.
+    """
+    f = _vec3(shape.get("from"), -8.0)
+    t = _vec3(shape.get("to"), 8.0)
+    uv = _vec3(shape.get("uv"))[:2]
+    side = max(float(texture_size[0]), float(texture_size[1]))
+    tw, th = float(image_size[0]), float(image_size[1])
+    width, height = t[0] - f[0], t[1] - f[1]
+    if width < 0:
+        f[0], t[0], width = t[0], f[0], -width
+    if height < 0:
+        f[1], t[1], height = t[1], f[1], -height
+    sx = max(1, int(math.ceil(width / side * tw - 1e-9)))
+    sy = max(1, int(math.ceil(height / side * th - 1e-9)))
+    sample_x0 = int(math.ceil(uv[0] / side * tw - 1e-9))
+    sample_y0 = int(math.ceil(uv[1] / side * th - 1e-9))
+    texscale = (math.ceil(width - 1e-9) / sx, math.ceil(height - 1e-9) / sy)
+    tex_pixel = (texscale[0] / side, texscale[1] / side)         # 1 / texsizescale
+    pix_uv = ((1 - 1 / 256) * tex_pixel[0], (1 - 1 / 256) * tex_pixel[1])
+    uv0 = (uv[0] / side, uv[1] / side)
+
+    frac_h = height - math.floor(height)
+    xs = [f[0] + i * texscale[0] for i in range(sx + 1)]
+    zs: list[float] = []
+    z = f[1]
+    for j in range(sy + 1):
+        zs.append(z)
+        z += texscale[1] * (frac_h if (j == sy - 1 and frac_h > 1e-9) else 1.0)
+    d0, d1 = f[2], f[2] + 1.0                                      # thickness (JSON Z)
+    mirror = bool(shape.get("texture_mirror", False))
+    invert = bool(shape.get("invert", False))
+    hide_front, hide_back = bool(shape.get("hide_front", False)), bool(shape.get("hide_back", False))
+
+    def solid(ax: int, ay: int) -> bool:
+        if ax < 0 or ay < 0 or ax >= sx or ay >= sy:
+            return False
+        return bool(opaque(sample_x0 + ax, sample_y0 + ay))
+
+    zero = to_blender((0.0, 0.0, 0.0))
+
+    def direction(n: Sequence[float]) -> Vec3:
+        v = to_blender(n)
+        return (v[0] - zero[0], v[1] - zero[1], v[2] - zero[2])
+
+    vertices: list[Vec3] = []
+    faces: list[tuple[int, int, int, int]] = []
+    loop_uvs: list[tuple[float, float]] = []
+    voxels = 0
+
+    def add_face(corners: list[Sequence[float]], outward: Sequence[float], uvs: list[tuple[float, float]]) -> None:
+        pts = [to_blender(c) for c in corners]
+        e1 = (pts[1][0] - pts[0][0], pts[1][1] - pts[0][1], pts[1][2] - pts[0][2])
+        e2 = (pts[2][0] - pts[0][0], pts[2][1] - pts[0][1], pts[2][2] - pts[0][2])
+        n = (e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0])
+        o = direction(outward)
+        order = [0, 1, 2, 3]
+        if (n[0] * o[0] + n[1] * o[1] + n[2] * o[2] < 0) != invert:
+            order = [0, 3, 2, 1]
+        base = len(vertices)
+        vertices.extend(pts[i] for i in order)
+        loop_uvs.extend(uvs[i] for i in order)
+        faces.append((base, base + 1, base + 2, base + 3))
+
+    for outer in range(sx):
+        for inner in range(sy):
+            ax = outer
+            ay = sy - 1 - inner
+            if mirror:
+                ax = sx - 1 - ax
+            if not solid(ax, ay):
+                continue
+            voxels += 1
+            wface = not solid(ax - 1, ay)
+            eface = not solid(ax + 1, ay)
+            aface = not solid(ax, ay - 1)
+            bface = not solid(ax, ay + 1)
+            if mirror:
+                wface, eface = eface, wface
+            u0 = uv0[0] + ax * tex_pixel[0]
+            v0 = uv0[1] + ay * tex_pixel[1]
+            u1, vb = u0 + pix_uv[0], v0 + pix_uv[1]
+            quad = [(u0, 1 - vb), (u1, 1 - vb), (u1, 1 - v0), (u0, 1 - v0)]    # BL, BR, TR, TL
+            X0, X1, Z0, Z1 = xs[outer], xs[outer + 1], zs[inner], zs[inner + 1]
+            if eface:
+                add_face([(X1, Z0, d0), (X1, Z0, d1), (X1, Z1, d1), (X1, Z1, d0)], (1, 0, 0), quad)
+            if wface:
+                add_face([(X0, Z0, d1), (X0, Z0, d0), (X0, Z1, d0), (X0, Z1, d1)], (-1, 0, 0), quad)
+            if not hide_front:   # "South": +Y in the engine, JSON +Z
+                add_face([(X0, Z0, d1), (X1, Z0, d1), (X1, Z1, d1), (X0, Z1, d1)], (0, 0, 1), quad)
+            if not hide_back:    # "North"
+                add_face([(X1, Z0, d0), (X0, Z0, d0), (X0, Z1, d0), (X1, Z1, d0)], (0, 0, -1), quad)
+            if aface:
+                add_face([(X0, Z1, d1), (X1, Z1, d1), (X1, Z1, d0), (X0, Z1, d0)], (0, 1, 0), quad)
+            if bface:
+                add_face([(X0, Z0, d0), (X1, Z0, d0), (X1, Z0, d1), (X0, Z0, d1)], (0, -1, 0), quad)
+    return Plane3D(vertices, faces, loop_uvs, voxels, (sx, sy))

@@ -1,6 +1,3 @@
-# Mine-imator Suite + Import for Blender 0.3.Fix1
-Native mineimator shapes are now supported (Making the importing of MCR34 rigs to blender possible (but it is still buggy))
-
 # Mine-imator Suite + Import for Blender 0.3.6
 
 Imports the frame-zero static state of Mine-imator 2.0.2 format-34 projects

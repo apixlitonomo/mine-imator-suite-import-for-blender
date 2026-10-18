@@ -16,14 +16,12 @@ result to Blender space:
 * V is flipped (GameMaker V=0 is the top row, Blender V=0 is the bottom)
 * vertices are welded by position; UVs and normals stay per face-corner
 
-Assumptions that were NOT in the supplied source (flagged in the report):
-* ``vbuffer_add_triangle``: flat normal = normalize(cross(p2-p1, p3-p1)); with
-  ``invert`` the normal is negated and the winding reversed.
-* ``negate(invert)`` is +1 / -1.
+Verified against the real vbuffer_add_triangle: the flat normal is
+(p3-p2)x(p1-p2) (== (p2-p1)x(p3-p1)) and ``invert`` swaps p1/p2 and negates it.
+Still assumed: ``negate(invert)`` is +1 / -1.
 * radius passed by Mine-imator is half a block (8 units), so a shape at scale
   1 is exactly one block across.
-* ``cube`` has no supplied generator; it is built as +/-radius with each face
-  mapping the whole tex1..tex2 rectangle.
+* ``cube`` is a port of vbuffer_create_cube.
 """
 
 from __future__ import annotations
@@ -321,22 +319,44 @@ def _sphere(s: _Soup, rad, tex1, tex2, detail, invert) -> None:
                     add(p1, n1, ip); add(p4, n4, i); add(p2, n2, ip)
 
 
-def _cube(s: _Soup, rad, tex1, tex2, invert) -> None:
-    """No GML was supplied for cubes: +/-rad box, whole tex rectangle per face."""
-    r = rad
-    # (corner order is counter-clockwise seen from outside, by the cross rule)
-    faces = [
-        ((r, -r, -r), (r, r, -r), (r, r, r), (r, -r, r)),        # +X
-        ((-r, r, -r), (-r, -r, -r), (-r, -r, r), (-r, r, r)),    # -X
-        ((r, r, -r), (-r, r, -r), (-r, r, r), (r, r, r)),        # +Y
-        ((-r, -r, -r), (r, -r, -r), (r, -r, r), (-r, -r, r)),    # -Y
-        ((-r, -r, r), (r, -r, r), (r, r, r), (-r, r, r)),        # +Z
-        ((-r, r, -r), (r, r, -r), (r, -r, -r), (-r, -r, -r)),    # -Z
-    ]
-    uvs = ((tex1[0], tex2[1]), (tex2[0], tex2[1]), (tex2[0], tex1[1]), (tex1[0], tex1[1]))
-    for a, b, c, d in faces:
-        s.add_triangle(*a, *b, *c, *uvs[0], *uvs[1], *uvs[2], invert)
-        s.add_triangle(*a, *c, *d, *uvs[0], *uvs[2], *uvs[3], invert)
+def _cube(s: _Soup, rad, tex1, tex2, thflip, tvflip, invert, mapped) -> None:
+    """Port of vbuffer_create_cube (same triangle/UV tables as the GML)."""
+    tex1, tex2 = list(tex1), list(tex2)
+    ts = (1 / 3, 1 / 2)
+
+    def flip(a, b):
+        a, b = list(a), list(b)
+        if thflip < 0:
+            a[0], b[0] = b[0], a[0]
+        if tvflip < 0:
+            a[1], b[1] = b[1], a[1]
+        return a, b
+
+    def face(origin, tex1, tex2):
+        if mapped:
+            tex1 = list(origin)
+            tex2 = [tex1[0] + ts[0], tex1[1] + ts[1]]
+            tex1, tex2 = flip(tex1, tex2)
+        return tex1, tex2
+
+    t1, t2 = face((ts[0] if invert else ts[0] * 2, 0), tex1, tex2)            # X+
+    s.add_triangle(rad, rad, -rad, rad, rad, rad, rad, -rad, rad, t1[0], t2[1], t1[0], t1[1], t2[0], t1[1], invert)
+    s.add_triangle(rad, rad, -rad, rad, -rad, rad, rad, -rad, -rad, t1[0], t2[1], t2[0], t1[1], t2[0], t2[1], invert)
+    t1, t2 = face((ts[0] * 2 if invert else ts[0], 0), tex1, tex2)            # X-
+    s.add_triangle(-rad, rad, rad, -rad, rad, -rad, -rad, -rad, rad, t2[0], t1[1], t2[0], t2[1], t1[0], t1[1], invert)
+    s.add_triangle(-rad, -rad, rad, -rad, rad, -rad, -rad, -rad, -rad, t1[0], t1[1], t2[0], t2[1], t1[0], t2[1], invert)
+    t1, t2 = face((0, 0), tex1, tex2)                                          # Y+
+    s.add_triangle(-rad, rad, rad, rad, rad, rad, rad, rad, -rad, t1[0], t1[1], t2[0], t1[1], t2[0], t2[1], invert)
+    s.add_triangle(-rad, rad, -rad, -rad, rad, rad, rad, rad, -rad, t1[0], t2[1], t1[0], t1[1], t2[0], t2[1], invert)
+    t1, t2 = face((0, ts[1]), tex1, tex2)                                      # Y-
+    s.add_triangle(rad, -rad, rad, -rad, -rad, rad, rad, -rad, -rad, t1[0], t1[1], t2[0], t1[1], t1[0], t2[1], invert)
+    s.add_triangle(-rad, -rad, rad, -rad, -rad, -rad, rad, -rad, -rad, t2[0], t1[1], t2[0], t2[1], t1[0], t2[1], invert)
+    t1, t2 = face(ts, tex1, tex2)                                              # Z+
+    s.add_triangle(-rad, -rad, rad, rad, -rad, rad, -rad, rad, rad, t1[0], t1[1], t2[0], t1[1], t1[0], t2[1], invert)
+    s.add_triangle(rad, -rad, rad, rad, rad, rad, -rad, rad, rad, t2[0], t1[1], t2[0], t2[1], t1[0], t2[1], invert)
+    t1, t2 = face((ts[0] * 2, ts[1]), tex1, tex2)                              # Z-
+    s.add_triangle(rad, -rad, -rad, -rad, -rad, -rad, -rad, rad, -rad, t2[0], t2[1], t1[0], t2[1], t1[0], t1[1], invert)
+    s.add_triangle(rad, rad, -rad, rad, -rad, -rad, -rad, rad, -rad, t2[0], t1[1], t2[0], t2[1], t1[0], t1[1], invert)
 
 
 # --------------------------------------------------------------------------
@@ -357,7 +377,7 @@ def generate_engine_triangles(params: ShapeParams, radius: float = MI_SHAPE_RADI
     elif kind == "sphere":
         _sphere(soup, radius, tex1, tex2, params.detail, params.invert)
     elif kind == "cube":
-        _cube(soup, radius, tex1, tex2, params.invert)
+        _cube(soup, radius, tex1, tex2, thflip, tvflip, params.invert, params.mapped)
     else:
         raise ValueError(f"Unsupported shape kind: {kind!r}")
     return soup.triangles

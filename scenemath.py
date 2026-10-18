@@ -136,16 +136,19 @@ class Inherit:
     color: bool = True
     alpha: bool = True
     visibility: bool = True
+    rot_point: bool = False
+    bend: bool = False
 
     @classmethod
     def of(cls, timeline: dict[str, Any]) -> "Inherit":
         raw = timeline.get("inherit")
         raw = raw if isinstance(raw, dict) else {}
 
-        def flag(key: str) -> bool:
-            return bool(raw.get(key, True))
+        def flag(key: str, default: bool = True) -> bool:
+            return bool(raw.get(key, default))
 
-        return cls(flag("position"), flag("rotation"), flag("scale"), flag("color"), flag("alpha"), flag("visibility"))
+        return cls(flag("position"), flag("rotation"), flag("scale"), flag("color"), flag("alpha"), flag("visibility"),
+                   flag("rot_point", False), flag("bend", False))
 
     @property
     def transforms_stripped(self) -> bool:
@@ -191,6 +194,16 @@ def parent_inverse_for(parent_world: Mat, inherit: Inherit) -> Mat:
 
 Color = tuple[float, float, float]
 WHITE: Color = (1.0, 1.0, 1.0)
+BLACK: Color = (0.0, 0.0, 0.0)
+
+
+def srgb_to_linear(c: float) -> float:
+    """Mine-imator colours are sRGB hex; Blender colour inputs are linear."""
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def color_linear(color: Color) -> Color:
+    return tuple(srgb_to_linear(c) for c in color)  # type: ignore[return-value]
 
 
 def parse_hex(value: Any, default: Color = WHITE) -> Color:
@@ -208,7 +221,7 @@ def parse_hex(value: Any, default: Color = WHITE) -> Color:
 @dataclass(frozen=True)
 class Style:
     rgb_mul: Color = WHITE
-    mix_color: Color = WHITE
+    mix_color: Color = BLACK
     mix_percent: float = 0.0
     alpha: float = 1.0
     visible: bool = True
@@ -233,7 +246,7 @@ def own_style(state: dict[str, Any]) -> Style:
         alpha = 1.0
     return Style(
         rgb_mul=parse_hex(state.get("RGB_MUL")),
-        mix_color=parse_hex(state.get("MIX_COLOR")),
+        mix_color=parse_hex(state.get("MIX_COLOR"), BLACK),
         mix_percent=percent,
         alpha=min(alpha, 1.0),
         visible=bool(state.get("VISIBLE", True)),
@@ -241,16 +254,14 @@ def own_style(state: dict[str, Any]) -> Style:
 
 
 def combine_style(parent: Style, own: Style, inherit: Inherit) -> Style:
+    """tl_update_matrix: RGB_MUL multiplies, MIX_COLOR adds (skipped when the
+    parent's is black), MIX_PERCENT adds and clamps, ALPHA multiplies."""
     rgb, mix_color, mix_percent = own.rgb_mul, own.mix_color, own.mix_percent
     if inherit.color:
         rgb = tuple(a * b for a, b in zip(parent.rgb_mul, own.rgb_mul))  # type: ignore[assignment]
-        p1, p2 = parent.mix_percent, own.mix_percent
-        if p1 > 1e-6 and p2 > 1e-6:
-            mix_percent = p1 + p2 - p1 * p2
-            w1, w2 = p1 * (1 - p2), p2
-            mix_color = tuple((a * w1 + b * w2) / (w1 + w2) for a, b in zip(parent.mix_color, own.mix_color))  # type: ignore[assignment]
-        elif p1 > 1e-6:
-            mix_color, mix_percent = parent.mix_color, p1
+        if parent.mix_color != BLACK:
+            mix_color = tuple(min(1.0, a + b) for a, b in zip(own.mix_color, parent.mix_color))  # type: ignore[assignment]
+        mix_percent = min(1.0, max(0.0, own.mix_percent + parent.mix_percent))
     alpha = own.alpha * parent.alpha if inherit.alpha else own.alpha
     visible = own.visible and (parent.visible if inherit.visibility else True)
     return Style(rgb, mix_color, mix_percent, alpha, visible)
@@ -294,3 +305,36 @@ def attached_children(project: Any, timeline_id: str) -> list[dict[str, Any]]:
     nested models, items, ... They hang off the parent's object."""
     return [c for c in project.children(timeline_id)
             if str(c.get("type", "")).lower() not in {"bodypart", "audio"}]
+
+
+# --------------------------------------------------------------------------
+# Children of bodyparts / shapes: matrices Mine-imator inserts between the
+# parent and the child's own timeline transform
+# --------------------------------------------------------------------------
+
+def lock_bend_matrix(spec: "modelgeom.BendSpec", angles: tuple[float, float, float]) -> Mat:
+    """model_part_get_bend_matrix(part, bend, (0,0,0)) = T(pivot) @ R(bend).
+
+    tl_update_matrix multiplies this into the parent matrix of every child with
+    ``lock_bend`` set, whatever the angle: such children are authored relative
+    to the bend pivot, not the part origin.
+    """
+    axis, pivot_value, _ = spec.axis_and_pivot()
+    pivot = [0.0, 0.0, 0.0]
+    pivot[axis] = pivot_value
+    return mul(translation(pivot), from_rot3(spec.bone_rotation(angles)))
+
+
+def rot_point_prefix(parent_kind: str, parent_timeline: dict[str, Any], child_inherit_rot_point: bool) -> "Mat | None":
+    """Cancel or add the parent's pivot shift for a child.
+
+    Children use ``parent.matrix`` unless ``inherit.rot_point`` is set, in which
+    case they use ``parent.matrix_render = matrix @ T(-rot_point)``.  Shape
+    objects already carry T(-pivot) in their Blender matrix, folders do not.
+    """
+    pivot = core.mi_vector(pivot_of(parent_timeline, parent_kind))
+    if all(abs(c) < 1e-12 for c in pivot):
+        return None
+    if parent_kind in SHAPE_TYPES:
+        return None if child_inherit_rot_point else translation(pivot)
+    return translation((-pivot[0], -pivot[1], -pivot[2])) if child_inherit_rot_point else None
