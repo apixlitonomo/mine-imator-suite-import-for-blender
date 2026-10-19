@@ -4,6 +4,12 @@ The Mine-imator Suite (environment, world scenery, camera and lights, Render Exp
 Mine-imator Importer core (by Alexandra). The importer core now builds all geometry; the Suite supplies
 everything around it.
 
+## Known Bugs (may be fixed later)
+
+1. Some materials will appear white if "Run Mcprep material preparation" is active while importing
+2. Imported grass blocks or transparency blocks will appear black (this can be manually fixed by changing the option in the transparency material from hashed to blended)
+3. some UVs from imported terrain are upside down (lmao how did that happen)
+
 ## What comes from where
 
 **Importer core (replaces the old Suite importing code):** characters, special blocks, custom `.mimodel`
