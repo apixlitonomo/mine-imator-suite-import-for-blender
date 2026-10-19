@@ -9,6 +9,7 @@ everything around it.
 1. Some materials will appear white if "Run Mcprep material preparation" is active while importing
 2. Imported grass blocks or transparency blocks will appear black (this can be manually fixed by changing the option in the transparency material from hashed to blended)
 3. some UVs from imported terrain are upside down (lmao how did that happen)
+4. While trying to import a piston it imports nothing (damn)
 
 ## What comes from where
 
