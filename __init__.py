@@ -1,27 +1,33 @@
-"""Mine-imator to Blender/MCprep Static Scene Bridge."""
+"""Mine-imator Suite + Import for Blender: the Suite's environment and scene tools on top of the Mine-imator Importer core."""
 
 from __future__ import annotations
 
 bl_info = {
     "name": "Mine-imator Suite + Import for Blender",
     "author": "Mine-imator MCprep Bridge contributors",
-    "version": (0, 3, 6),
+    "version": (0, 4, 0),
     "blender": (5, 2, 0),
     "location": "File > Import; 3D View > Sidebar > MI Bridge",
-    "description": "Import Mine-imator scenes, assets, and environments for Blender and MCprep",
+    "description": "Import Mine-imator projects, objects and models (rigs, IK, bends, animation) with the full Suite environment",
     "category": "Import-Export",
 }
 
+import os
 import traceback
 from pathlib import Path
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, PointerProperty, StringProperty
+from bpy.props import (
+    BoolProperty, CollectionProperty, EnumProperty, FloatProperty, FloatVectorProperty,
+    IntProperty, PointerProperty, StringProperty,
+)
 from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup
 from bpy_extras.io_utils import ImportHelper
 
-from . import core, render_export, suite_environment
-from .blender_importer import CATEGORY_NAMES, ImportOptions, SceneImporter, preflight, write_report
+from . import core, mi_data, render_export, suite_environment
+from .blender_importer import (
+    CATEGORY_NAMES, IMPORT_EXTENSIONS, ImportOptions, SceneImporter, preflight, write_report,
+)
 
 
 def _default_mineimator() -> str:
@@ -243,13 +249,77 @@ class MIBRIDGE_PG_settings(PropertyGroup):
         description="Run MCprep's material preparation after geometry creation when MCprep is enabled",
         default=True,
     )
-    honor_item_keyframe_changes: BoolProperty(
-        name="Use frame-0 item swaps",
-        description=(
-            "Override each template item with its frame-0 ITEM/ITEM_NAME value; "
-            "leave disabled for projects whose saved compatibility hint is stale"
-        ),
+    mi_version: EnumProperty(
+        name="Mine-imator version",
+        description="Mine-imator version the project was created with",
+        items=mi_data.VERSIONS,
+        default="AUTO",
+    )
+    frame: IntProperty(
+        name="Frame",
+        description="Timeline frame whose pose is imported",
+        default=0, min=0,
+    )
+    animation: BoolProperty(
+        name="Import animation",
+        description="Bake the project's keyframes as object/bone animation (off = a single static pose)",
         default=False,
+    )
+    anim_step: IntProperty(
+        name="Step",
+        description="Frames between baked keyframes",
+        default=1, min=1, max=50,
+    )
+    unit_scale: FloatProperty(
+        name="Scale",
+        description="Blender meters per Mine-imator unit (1/16 makes one block 1 meter)",
+        default=1.0 / 16.0, min=0.0001, max=100.0, precision=4,
+    )
+    import_hidden: BoolProperty(
+        name="Import hidden objects",
+        description="Also import hidden or invisible objects (they stay hidden in Blender)",
+        default=True,
+    )
+    pack_textures: BoolProperty(
+        name="Pack textures",
+        description="Store the textures inside the .blend file",
+        default=True,
+    )
+    merge_vertices: BoolProperty(
+        name="Merge vertices",
+        description="Merge coincident vertices of each part",
+        default=True,
+    )
+    rig: BoolProperty(
+        name="Create armatures",
+        description="One armature per model: a bone per part and another per bend joint, with weighted meshes",
+        default=True,
+    )
+    bend_weights: BoolProperty(
+        name="Weighted bends",
+        description="Every bendable part gets two bones and influence weights, also static bends. "
+                    "Off = static bends are baked with exact geometry",
+        default=True,
+    )
+    ik: BoolProperty(
+        name="IK constraints",
+        description="Solve Mine-imator's IK on import and add matching Blender IK constraints",
+        default=True,
+    )
+    ik_keep_pose: BoolProperty(
+        name="Keep pose",
+        description="Ignore the scale of IK limbs (Blender IK cannot stretch the chain) so the imported pose does not shift",
+        default=True,
+    )
+    depth_masks: BoolProperty(
+        name="Emulate depth masks",
+        description="Near-invisible objects with lower 'depth' cut (Boolean) what Mine-imator draws after them, like the eye sockets of many rigs",
+        default=True,
+    )
+    standard_view: BoolProperty(
+        name="'Standard' view transform",
+        description="Switch the scene to the Standard view transform so colors look like they do in Mine-imator",
+        default=True,
     )
     remove_startup_cube: BoolProperty(
         name="Remove untouched Blender startup cube",
@@ -283,10 +353,23 @@ def _options(settings: MIBRIDGE_PG_settings) -> ImportOptions:
         asset_pack_path=bpy.path.abspath(settings.asset_pack_path) if settings.asset_pack_path else "",
         mineways_path=bpy.path.abspath(settings.mineways_path) if settings.mineways_path else "",
         use_mcprep=settings.use_mcprep,
-        honor_item_keyframe_changes=settings.honor_item_keyframe_changes,
         remove_startup_cube=settings.remove_startup_cube,
         mineimator_suite=settings.mineimator_suite,
         outer_layers_3d=settings.outer_layers_3d,
+        version=settings.mi_version,
+        frame=settings.frame,
+        animation=settings.animation,
+        anim_step=settings.anim_step,
+        unit_scale=settings.unit_scale,
+        import_hidden=settings.import_hidden,
+        pack_textures=settings.pack_textures,
+        merge_vertices=settings.merge_vertices,
+        depth_masks=settings.depth_masks,
+        rig=settings.rig,
+        ik=settings.ik,
+        ik_keep_pose=settings.ik_keep_pose,
+        bend_weights=settings.bend_weights,
+        standard_view=settings.standard_view,
     )
 
 
@@ -322,30 +405,39 @@ class MIBRIDGE_OT_preflight(Operator):
         return {"FINISHED"}
 
 
+def _import_one(context: bpy.types.Context, path: str):
+    settings = context.scene.mi_bridge
+    return SceneImporter(context, bpy.path.abspath(path), _options(settings)).import_scene()
+
+
+def _import_summary(settings, report) -> list[str]:
+    summary = [
+        f"Created: {report.collection_name}",
+        f"Accounted objects: {sum(report.imported.values())}",
+        f"Placeholders: {len(report.placeholders)}; missing: {len(report.missing)}",
+        "Full details: Text Editor > Mine-imator Bridge Report",
+    ]
+    if settings.outer_layers_3d:
+        summary.insert(2, f"3D outer layers: {report.created['3d_outer_layer']} parts")
+    return summary
+
+
 class MIBRIDGE_OT_import_scene(Operator):
     bl_idname = "mibridge.import_scene"
     bl_label = "Import Mine-imator Scene"
-    bl_description = "Import only the frame-zero static state into a new collection"
+    bl_description = "Import the project in the Project field into a new collection"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         settings = context.scene.mi_bridge
         try:
-            project = core.load_project(bpy.path.abspath(settings.project_path))
-            report = SceneImporter(context, project, _options(settings)).import_scene()
+            report = _import_one(context, settings.project_path)
         except Exception as exc:
             traceback.print_exc()
             self.report({"ERROR"}, str(exc))
             _popup(context, "Mine-imator import failed", [str(exc), "See Blender's system console for details."], "ERROR")
             return {"CANCELLED"}
-        summary = [
-            f"Created: {report.collection_name}",
-            f"Accounted objects: {sum(report.imported.values())}",
-            f"Placeholders: {len(report.placeholders)}; missing: {len(report.missing)}",
-            "Full details: Text Editor > Mine-imator Bridge Report",
-        ]
-        if settings.outer_layers_3d:
-            summary.insert(2, f"3D outer layers: {report.created['3d_outer_layer']} parts")
+        summary = _import_summary(settings, report)
         _popup(context, "Mine-imator import complete", summary, "CHECKMARK")
         self.report({"INFO"}, summary[0])
         return {"FINISHED"}
@@ -354,10 +446,12 @@ class MIBRIDGE_OT_import_scene(Operator):
 class MIBRIDGE_OT_import_file(Operator, ImportHelper):
     bl_idname = "import_scene.mineimator_project"
     bl_label = "Import Mine-imator Project"
-    bl_description = "Choose a .miproject file, or paste a Mine-imator project directory path"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_description = "Import .miproject, .miobject or .mimodel files (or paste a Mine-imator project directory path)"
+    bl_options = {"REGISTER", "UNDO", "PRESET"}
     filename_ext = ".miproject"
-    filter_glob: StringProperty(default="*.miproject", options={"HIDDEN"})
+    filter_glob: StringProperty(default="*.miproject;*.miobject;*.mimodel;*.backup*", options={"HIDDEN"})
+    files: CollectionProperty(type=bpy.types.OperatorFileListElement, options={"HIDDEN", "SKIP_SAVE"})
+    directory: StringProperty(subtype="DIR_PATH", options={"HIDDEN", "SKIP_SAVE"})
     outer_layers_3d: BoolProperty(
         name="3D character outer layers",
         description="Turn player-skin hat, jacket, sleeve, and pants pixels into one-texel-deep 3D geometry during this import",
@@ -367,15 +461,61 @@ class MIBRIDGE_OT_import_file(Operator, ImportHelper):
     def invoke(self, context, event):
         _initialize_scene_defaults(context)
         self.outer_layers_3d = context.scene.mi_bridge.outer_layers_3d
+        # Dragging files into the viewport already supplies the paths: only show the options.
+        if self.directory and self.files:
+            return context.window_manager.invoke_props_dialog(self, width=360)
         return super().invoke(context, event)
 
-    def draw(self, _context):
-        self.layout.prop(self, "outer_layers_3d", icon="MOD_SOLIDIFY")
+    def draw(self, context):
+        settings = context.scene.mi_bridge
+        layout = self.layout
+        layout.prop(self, "outer_layers_3d", icon="MOD_SOLIDIFY")
+        layout.prop(settings, "mi_version")
+        layout.prop(settings, "frame")
+        layout.prop(settings, "animation")
+        row = layout.row()
+        row.enabled = settings.animation
+        row.prop(settings, "anim_step")
+        layout.prop(settings, "rig")
+        row = layout.row()
+        row.enabled = settings.rig
+        row.prop(settings, "ik")
+        layout.label(text="More options: 3D View > Sidebar > MI Bridge", icon="INFO")
+
+    def _paths(self) -> list[str]:
+        paths: list[str] = []
+        if self.directory and self.files:
+            paths = [os.path.join(self.directory, item.name) for item in self.files if item.name]
+        if not paths and self.filepath:
+            paths = [self.filepath]
+        return [
+            path for path in paths
+            if path.lower().endswith(IMPORT_EXTENSIONS) or ".backup" in path.lower() or os.path.isdir(path)
+        ]
 
     def execute(self, context):
-        context.scene.mi_bridge.project_path = self.filepath
-        context.scene.mi_bridge.outer_layers_3d = self.outer_layers_3d
-        return bpy.ops.mibridge.import_scene()
+        settings = context.scene.mi_bridge
+        settings.outer_layers_3d = self.outer_layers_3d
+        paths = self._paths()
+        if not paths:
+            self.report({"ERROR"}, "Select a .miproject, .miobject or .mimodel file")
+            return {"CANCELLED"}
+        done = 0
+        last = None
+        for path in paths:
+            settings.project_path = path
+            try:
+                last = _import_one(context, path)
+            except Exception as exc:
+                traceback.print_exc()
+                self.report({"ERROR"}, f"{os.path.basename(path)}: {exc}")
+                continue
+            done += 1
+            self.report({"INFO"}, f"{os.path.basename(path)}: created {last.collection_name}")
+        if not done:
+            return {"CANCELLED"}
+        _popup(context, "Mine-imator import complete", _import_summary(settings, last), "CHECKMARK")
+        return {"FINISHED"}
 
 
 class MIBRIDGE_OT_reload_environment(Operator):
@@ -444,7 +584,6 @@ def _draw_settings(layout: bpy.types.UILayout, settings: MIBRIDGE_PG_settings, c
         else:
             categories.label(text="Import Scene again to apply this setting", icon="INFO")
     layout.prop(settings, "use_mcprep")
-    layout.prop(settings, "honor_item_keyframe_changes")
     layout.prop(settings, "remove_startup_cube")
     row = layout.row(align=True)
     row.operator("mibridge.preflight", icon="CHECKMARK")
@@ -460,6 +599,43 @@ class MIBRIDGE_PT_panel(Panel):
 
     def draw(self, context):
         _draw_settings(self.layout, context.scene.mi_bridge, context)
+
+
+class MIBRIDGE_PT_import_options(Panel):
+    bl_label = "Pose, Rigging and Animation"
+    bl_idname = "MIBRIDGE_PT_import_options"
+    bl_parent_id = "MIBRIDGE_PT_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "MI Bridge"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        settings = context.scene.mi_bridge
+        layout = self.layout
+        layout.prop(settings, "mi_version")
+        layout.prop(settings, "frame")
+        layout.prop(settings, "animation")
+        row = layout.row()
+        row.enabled = settings.animation
+        row.prop(settings, "anim_step")
+        layout.separator()
+        layout.prop(settings, "rig")
+        column = layout.column()
+        column.enabled = settings.rig
+        column.prop(settings, "bend_weights")
+        row = column.row()
+        row.prop(settings, "ik")
+        sub = row.row()
+        sub.enabled = settings.ik
+        sub.prop(settings, "ik_keep_pose")
+        layout.separator()
+        layout.prop(settings, "unit_scale")
+        layout.prop(settings, "import_hidden")
+        layout.prop(settings, "pack_textures")
+        layout.prop(settings, "merge_vertices")
+        layout.prop(settings, "depth_masks")
+        layout.prop(settings, "standard_view")
 
 
 class MIBRIDGE_PT_environment(Panel):
@@ -644,7 +820,7 @@ class MIBRIDGE_PT_environment_wind(Panel):
 
 
 def _menu_import(self, _context):
-    self.layout.operator(MIBRIDGE_OT_import_file.bl_idname, text="Mine-imator Project (.miproject)")
+    self.layout.operator(MIBRIDGE_OT_import_file.bl_idname, text="Mine-imator (.miproject/.miobject/.mimodel)")
 
 
 CLASSES = (
@@ -657,6 +833,7 @@ CLASSES = (
     MIBRIDGE_OT_reload_environment,
     MIBRIDGE_OT_apply_environment,
     MIBRIDGE_PT_panel,
+    MIBRIDGE_PT_import_options,
     MIBRIDGE_PT_environment,
     MIBRIDGE_PT_environment_sunlight,
     MIBRIDGE_PT_environment_sky,
@@ -666,6 +843,21 @@ CLASSES = (
     MIBRIDGE_PT_environment_fog,
     MIBRIDGE_PT_environment_wind,
 )
+
+
+# Drag and drop of Mine-imator files into the 3D viewport or Outliner (Blender 4.1+)
+if hasattr(bpy.types, "FileHandler"):
+    class MIBRIDGE_FH_import(bpy.types.FileHandler):
+        bl_idname = "MIBRIDGE_FH_import"
+        bl_label = "Mine-imator"
+        bl_import_operator = "import_scene.mineimator_project"
+        bl_file_extensions = ";".join(IMPORT_EXTENSIONS)
+
+        @classmethod
+        def poll_drop(cls, context):
+            return context.area is not None and context.area.type in ("VIEW_3D", "OUTLINER")
+
+    CLASSES = CLASSES + (MIBRIDGE_FH_import,)
 
 
 def register():

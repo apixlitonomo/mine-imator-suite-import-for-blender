@@ -1,8 +1,14 @@
-"""Blender-side scene construction for the Mine-imator bridge."""
+"""Suite-side import orchestration: Mine-imator Suite extras around the Mine-imator Importer core.
+
+The geometry, rigs, IK, bends and optional animation come from ``mi_builder`` (the "new importer").
+This module keeps what the Suite adds on top of it: the import collection tree and category filters,
+cameras, lights, paths, particle placeholders, world scenery (Mineways / ``.meshcache``), the full
+Mine-imator environment, MCprep material preparation, the startup-cube cleanup and the report.
+"""
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,11 +19,11 @@ import subprocess
 import tempfile
 
 import bpy
-import bmesh
 from mathutils import Matrix, Vector
 
-from . import core, meshcache, modelgeom, scenemath, shapegen
+from . import core, meshcache, mi_assets, mi_builder, mi_data
 
+IMPORT_EXTENSIONS = (".miproject", ".miobject", ".mimodel")
 
 CATEGORY_NAMES = {
     "characters": "Characters & Entities",
@@ -32,57 +38,40 @@ CATEGORY_NAMES = {
     "helpers": "Paths & Helpers",
 }
 
-TYPE_CATEGORY = {
-    "char": "characters",
-    "entity": "characters",
-    "item": "items",
-    "block": "blocks",
-    "spblock": "blocks",
-    "model": "models",
-    "scenery": "scenery",
-    "cube": "primitives",
-    "cone": "primitives",
-    "cylinder": "primitives",
-    "sphere": "primitives",
-    "surface": "primitives",
-    "text": "primitives",
-    "pointlight": "lights",
-    "spotlight": "lights",
-    "spot_light": "lights",
-    "camera": "camera",
-    "background": "environment",
-    "path": "helpers",
-    "path_point": "helpers",
-    "folder": "helpers",
-    "particle_spawner": "helpers",
-    "particle": "helpers",
-}
-
-
-MODEL_TYPES = {"char", "entity", "model", "spblock"}
-BEND_BONE_NAME = "MI Bend"
-# Bend rigs are only created when a part has a non-zero frame-0 bend angle.
-# Flip this to get a (posable) rig on every bendable part.
-ALWAYS_CREATE_BEND_RIGS = False
-
 
 @dataclass
 class ImportOptions:
+    # --- Suite ---------------------------------------------------------------------------
     categories: set[str] = field(default_factory=lambda: set(CATEGORY_NAMES))
     mineimator_path: str = ""
     asset_pack_path: str = ""
     mineways_path: str = ""
     use_mcprep: bool = True
-    honor_item_keyframe_changes: bool = False
     remove_startup_cube: bool = True
     mineimator_suite: bool = True
     outer_layers_3d: bool = False
+    # --- Importer core (frame / animation / rigging) -----------------------------------------
+    version: str = "AUTO"
+    frame: int = 0
+    animation: bool = False
+    anim_step: int = 1
+    unit_scale: float = 1.0 / 16.0
+    import_hidden: bool = True
+    pack_textures: bool = True
+    merge_vertices: bool = True
+    depth_masks: bool = True
+    rig: bool = True
+    ik: bool = True
+    ik_keep_pose: bool = True
+    bend_weights: bool = True
+    standard_view: bool = True
 
 
 @dataclass
 class ImportReport:
     project_path: str = ""
     collection_name: str = ""
+    animation_imported: bool = False
     imported: Counter = field(default_factory=Counter)
     created: Counter = field(default_factory=Counter)
     skipped: Counter = field(default_factory=Counter)
@@ -93,11 +82,12 @@ class ImportReport:
 
     def text(self) -> str:
         lines = [
-            "Mine-imator MCprep Bridge report",
+            "Mine-imator Suite + Import report",
             f"Bridge version: {core.ADDON_VERSION}",
             f"Source: {self.project_path}",
             f"Collection: {self.collection_name or '(preflight)'}",
-            "Animation: intentionally not imported (frame 0 only)",
+            "Animation: baked from the project's keyframes" if self.animation_imported
+            else "Animation: not imported (single pose)",
             "",
             "Accounted root timelines:",
         ]
@@ -119,6 +109,17 @@ class ImportReport:
         return "\n".join(lines)
 
 
+def resolve_import_path(value: str | os.PathLike[str]) -> Path:
+    """A .miproject/.miobject/.mimodel file, or a directory containing exactly one .miproject."""
+    path = Path(value).expanduser()
+    if path.is_file():
+        if path.suffix.lower() not in IMPORT_EXTENSIONS and ".backup" not in path.name.lower():
+            raise core.BridgeError(f"Not a Mine-imator project, object or model: {path}")
+        return path.resolve()
+    return core.resolve_project_path(path)
+
+
+
 def _use_hashed_alpha(material: bpy.types.Material) -> None:
     """Mine-imator's alpha hashing: a fragment with 0 < alpha < 1 is discarded when
     alpha < hash(position, sample), otherwise it becomes fully opaque and writes
@@ -132,36 +133,6 @@ def _use_hashed_alpha(material: bpy.types.Material) -> None:
     except Exception:
         pass
 
-
-def _apply_color_nodes(material: bpy.types.Material, tint: tuple[float, float, float],
-                       mix: tuple[float, float, float], mix_percent: float) -> None:
-    """Multiply the texture by `tint`, then blend toward `mix` (linear colours)."""
-    nodes, links = material.node_tree.nodes, material.node_tree.links
-    principled = nodes.get("Principled BSDF")
-    tex_node = next((node for node in nodes if node.type == "TEX_IMAGE"), None)
-    if tex_node is None or principled is None:
-        return
-    try:
-        socket = tex_node.outputs["Color"]
-        if tint != scenemath.WHITE:
-            node = nodes.new("ShaderNodeMixRGB")
-            node.blend_type = "MULTIPLY"
-            node.inputs[0].default_value = 1.0
-            node.inputs[2].default_value = (*tint, 1.0)
-            links.new(socket, node.inputs[1])
-            socket = node.outputs["Color"]
-        if mix_percent > 1e-4:
-            node = nodes.new("ShaderNodeMixRGB")
-            node.blend_type = "MIX"
-            node.inputs[0].default_value = mix_percent
-            node.inputs[2].default_value = (*mix, 1.0)
-            links.new(socket, node.inputs[1])
-            socket = node.outputs["Color"]
-        links.new(socket, principled.inputs["Base Color"])
-    except Exception:
-        pass
-
-
 def _hex_color(value: Any, alpha: float = 1.0) -> tuple[float, float, float, float]:
     raw = str(value or "#FFFFFF").lstrip("#")
     if len(raw) == 8:
@@ -171,7 +142,6 @@ def _hex_color(value: Any, alpha: float = 1.0) -> tuple[float, float, float, flo
         return tuple(int(raw[index:index + 2], 16) / 255.0 for index in (0, 2, 4)) + (alpha,)
     except (ValueError, IndexError):
         return (1.0, 1.0, 1.0, alpha)
-
 
 def _remove_untouched_startup_cube(context: bpy.types.Context, report: ImportReport) -> bool:
     """Remove only Blender's pristine default cube, never a user-authored cube."""
@@ -221,7 +191,6 @@ def _remove_untouched_startup_cube(context: bpy.types.Context, report: ImportRep
     report.created["startup_cube_removed"] += 1
     return True
 
-
 def _link_object(obj: bpy.types.Object, collection: bpy.types.Collection) -> None:
     for current in list(obj.users_collection):
         current.objects.unlink(obj)
@@ -234,69 +203,6 @@ def _new_empty(name: str, collection: bpy.types.Collection, display: str = "PLAI
     obj.empty_display_size = 0.25
     collection.objects.link(obj)
     return obj
-
-
-def _metadata(obj: bpy.types.Object, project: core.ProjectIndex, timeline: dict[str, Any], template: dict[str, Any] | None = None, resource: Path | str | None = None) -> None:
-    obj["mi_bridge_version"] = core.ADDON_VERSION
-    obj["mi_source_project"] = str(project.path)
-    obj["mi_id"] = str(timeline.get("id", ""))
-    obj["mi_type"] = str(timeline.get("type", ""))
-    obj["mi_template"] = str(timeline.get("temp", "null"))
-    if template:
-        obj["mi_template_type"] = str(template.get("type", ""))
-    if resource:
-        obj["mi_resource_path"] = str(resource)
-
-
-def _apply_transform(obj: bpy.types.Object, state: dict[str, Any], include_bend: bool = False) -> None:
-    location = core.mi_position(state)
-    rotation = _engine_rotation_matrix(state)
-    if include_bend:
-        rotation = rotation @ _engine_rotation_matrix({
-            "ROT_X": state.get("BEND_ANGLE_X", 0.0),
-            "ROT_Y": state.get("BEND_ANGLE_Y", 0.0),
-            "ROT_Z": state.get("BEND_ANGLE_Z", 0.0),
-        })
-    obj.matrix_basis = _transform_matrix(location, rotation, core.mi_scale(state))
-    visible = bool(state.get("VISIBLE", True)) and float(state.get("ALPHA", 1.0)) > 0.0
-    obj.hide_viewport = not visible
-    obj.hide_render = not visible
-
-
-def _engine_rotation_matrix(state: dict[str, Any]) -> Matrix:
-    """Reproduce GameMaker's Z-X-Y Mine-imator rotation composition.
-
-    Matrix::Rotation composes the engine rotation as Y @ X @ Z after accounting
-    for Mine-imator's column-major storage.  matrix_build then transposes it.
-    Reflecting engine Y into Blender Y produces Z @ X @ -Y.  Treating these
-    values as an ordinary XYZ Euler breaks mixed-axis limb poses.
-    """
-    rx = math.radians(float(state.get("ROT_X", 0.0)))
-    ry = math.radians(float(state.get("ROT_Y", 0.0)))
-    rz = math.radians(float(state.get("ROT_Z", 0.0)))
-    return (
-        Matrix.Rotation(rz, 4, "Z")
-        @ Matrix.Rotation(rx, 4, "X")
-        @ Matrix.Rotation(-ry, 4, "Y")
-    )
-
-
-def _mimodel_rotation_matrix(value: Any) -> Matrix:
-    values = list(value) if isinstance(value, (list, tuple)) else [0.0, 0.0, 0.0]
-    values = (values + [0.0, 0.0, 0.0])[:3]
-    # .mimodel stores Y-up X/Y/Z; value_get_point3D swaps JSON Y/Z into the
-    # engine's Z-up axes before matrix_build is called.
-    return _engine_rotation_matrix({"ROT_X": values[0], "ROT_Y": values[2], "ROT_Z": values[1]})
-
-
-def _transform_matrix(location: Any, rotation: Matrix, scale: Any) -> Matrix:
-    scale_values = list(scale)
-    return (
-        Matrix.Translation(Vector(location))
-        @ rotation
-        @ Matrix.Diagonal((float(scale_values[0]), float(scale_values[1]), float(scale_values[2]), 1.0))
-    )
-
 
 def _new_material(name: str, image_path: Path | None = None, color: tuple[float, float, float, float] = (1, 1, 1, 1)) -> bpy.types.Material:
     material = bpy.data.materials.new(name=name)
@@ -335,7 +241,6 @@ def _new_material(name: str, image_path: Path | None = None, color: tuple[float,
         material.use_transparency_overlap = False
     material["mi_pixel_art"] = True
     return material
-
 
 def _meshcache_atlas(assets: core.AssetStore, *, animated: bool) -> bpy.types.Image:
     """Build Mine-imator's exact 32-column block sheet inside Blender.
@@ -516,33 +421,61 @@ def _meshcache_object(raw: meshcache.RawMesh, name: str, material: bpy.types.Mat
     obj["mi_meshcache_buffer"] = raw.buffer_name
     return obj
 
+def _mcprep_texture(name: str) -> Path | None:
+    """Last-resort lookup in MCprep's bundled default resource pack."""
+    raw = str(name).replace("minecraft:", "").replace("\\", "/")
+    raw = raw.removeprefix("textures/")
+    if not Path(raw).suffix:
+        raw += ".png"
+    candidates: list[Path] = []
+    scripts = Path(bpy.utils.user_resource("SCRIPTS"))
+    addon_roots = [scripts / "addons" / "MCprep_addon", scripts / "addons_core" / "MCprep_addon"]
+    for addon_root in addon_roots:
+        pack = addon_root / "MCprep_resources" / "resourcepacks" / "mcprep_default" / "assets" / "minecraft" / "textures"
+        candidates.extend([pack / raw, pack / Path(raw).name])
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+
+def _tag(obj: bpy.types.Object, project_path: Path | str, tl: Any = None, extra: Path | str | None = None) -> None:
+    """Suite metadata on an object (kept from the original bridge so existing tooling still finds it)."""
+    obj["mi_bridge_version"] = core.ADDON_VERSION
+    obj["mi_source_project"] = str(project_path)
+    if tl is not None:
+        obj["mi_id"] = str(tl.id)
+        obj["mi_type"] = str(tl.type)
+        obj["mi_template"] = str(tl.temp or "null")
+    if extra:
+        obj["mi_resource_path"] = str(extra)
+
 
 def _import_meshcache_world(
     cache_path: Path,
     name: str,
-    timeline: dict[str, Any],
-    template: dict[str, Any] | None,
+    root: bpy.types.Object,
+    tl: Any,
+    template: Any,
     collection: bpy.types.Collection,
-    project: core.ProjectIndex,
+    project_path: Path,
     assets: core.AssetStore,
     report: ImportReport,
 ) -> bpy.types.Object:
+    """Recover world scenery from a Mine-imator format-2 ``.meshcache`` under an existing root empty."""
     header = meshcache.read_header(cache_path)
-    root = _new_empty(name, collection)
-    _apply_transform(root, core.frame0_state(timeline))
-    _metadata(root, project, timeline, template, cache_path)
+    _tag(root, project_path, tl, cache_path)
     root["mi_meshcache_format"] = header.format
     root["mi_meshcache_size"] = list(header.size)
 
     static_atlas = _meshcache_atlas(assets, animated=False)
     animated_atlas = _meshcache_atlas(assets, animated=True)
-    # Mine-imator first subtracts the template's automatic scenery pivot
-    # (half of the crop in X/Y), then renders the cached vertices through
-    # render_world_block's legacy basis. In engine space that basis is
-    # (x, y, z) -> (y, -x + sizeY, z). Reflecting engine Y into Blender Y
-    # produces the matrices below. Both stages are required: omitting the
-    # pivot rotates the crop around a corner and leaves its terrain hundreds
-    # of blocks away from the camera.
+    # Mine-imator first subtracts the template's automatic scenery pivot (half of the crop in X/Y), then
+    # renders the cached vertices through render_world_block's legacy basis. In engine space that basis is
+    # (x, y, z) -> (y, -x + sizeY, z). Reflecting engine Y into Blender Y produces the matrices below. Both
+    # stages are required: omitting the pivot rotates the crop around a corner and leaves its terrain
+    # hundreds of blocks away from the camera.
     legacy_basis = (
         Matrix.Translation((0.0, -float(header.size[1]), 0.0))
         @ Matrix.Rotation(math.radians(90.0), 4, "Z")
@@ -563,14 +496,14 @@ def _import_meshcache_world(
             materials[key] = _meshcache_material(
                 f"MI World {role.replace('_', ' ').title()} D{raw.depth}", atlas, raw.depth, role
             )
-            materials[key]["mi_source_project"] = str(project.path)
+            materials[key]["mi_source_project"] = str(project_path)
             materials[key]["mi_bridge_version"] = core.ADDON_VERSION
             materials[key]["mi_suite_id"] = report.collection_name
         object_name = f"{name} - {role.replace('_', ' ').title()} {raw.mesh_index + 1}"
         obj = _meshcache_object(raw, object_name, materials[key], collection)
         obj.parent = root
         obj.matrix_basis = scenery_basis
-        _metadata(obj, project, timeline, template, cache_path)
+        _tag(obj, project_path, tl, cache_path)
         imported_vertices += raw.vertex_count
         imported_triangles += raw.index_count // 3
         report.created["scenery_mesh"] += 1
@@ -583,1383 +516,199 @@ def _import_meshcache_world(
     return root
 
 
-def _placeholder(name: str, message: str, collection: bpy.types.Collection, project: core.ProjectIndex, timeline: dict[str, Any], report: ImportReport) -> bpy.types.Object:
-    # A single vertex: it keeps the hierarchy and transform for whatever hangs off
-    # a missing resource, but draws nothing (the old cube sat in front of the rig).
-    mesh = bpy.data.meshes.new(f"{name} Placeholder Mesh")
-    mesh.from_pydata([(0.0, 0.0, 0.0)], [], [])
-    obj = bpy.data.objects.new(f"MISSING - {name}", mesh)
-    collection.objects.link(obj)
-    obj["mi_placeholder_reason"] = message
-    _apply_transform(obj, core.frame0_state(timeline))
-    _metadata(obj, project, timeline)
-    report.placeholders.append(f"{name}: {message}")
-    report.created["placeholder"] += 1
-    return obj
-
-
-def _box_geometry(shape: dict[str, Any], texture_size: tuple[float, float]) -> tuple[list[tuple[float, float, float]], list[tuple[int, ...]], list[tuple[float, float]]]:
-    start = list(shape.get("from", [-8, -8, -8]))
-    end = list(shape.get("to", [8, 8, 8]))
-    while len(start) < 3: start.append(0)
-    while len(end) < 3: end.append(0)
-    inflate = float(shape.get("inflate", 0.0))
-    # Shape position is its transform origin, not part of the vertex geometry.
-    # Baking it here makes the position rotate around the parent part origin and
-    # scatters multi-shape custom models when a shape has its own rotation.
-    lo = [min(float(start[i]), float(end[i])) - inflate for i in range(3)]
-    hi = [max(float(start[i]), float(end[i])) + inflate for i in range(3)]
-    mi_vertices = [
-        (lo[0], lo[1], lo[2]), (hi[0], lo[1], lo[2]), (hi[0], hi[1], lo[2]), (lo[0], hi[1], lo[2]),
-        (lo[0], lo[1], hi[2]), (hi[0], lo[1], hi[2]), (hi[0], hi[1], hi[2]), (lo[0], hi[1], hi[2]),
-    ]
-    vertices = [core.mi_vector(vertex) for vertex in mi_vertices]
-    faces = [(0, 3, 2, 1), (5, 6, 7, 4), (4, 7, 3, 0), (1, 2, 6, 5), (3, 7, 6, 2), (4, 0, 1, 5)]
-    u0, v0 = [float(x) for x in (list(shape.get("uv", [0, 0])) + [0, 0])[:2]]
-    # UV dimensions deliberately exclude inflation and shape scale, matching
-    # Mine-imator's to_noscale/from_noscale calculation.
-    width = abs(float(end[0]) - float(start[0]))
-    height = abs(float(end[1]) - float(start[1]))
-    depth = abs(float(end[2]) - float(start[2]))
-    tex_w, tex_h = texture_size
-    points = {
-        "south": [(u0, v0), (u0 + width, v0), (u0 + width, v0 + height), (u0, v0 + height)],
-        "east": [(u0 + width, v0), (u0 + width + depth, v0), (u0 + width + depth, v0 + height), (u0 + width, v0 + height)],
-        "west": [(u0 - depth, v0), (u0, v0), (u0, v0 + height), (u0 - depth, v0 + height)],
-        "north": [(u0 + width + depth, v0), (u0 + width + depth + width, v0), (u0 + width + depth + width, v0 + height), (u0 + width + depth, v0 + height)],
-        "up": [(u0, v0 - depth), (u0 + width, v0 - depth), (u0 + width, v0), (u0, v0)],
-        # Mine-imator flips the down face vertically.
-        "down": [(u0 + width, v0), (u0 + width * 2, v0), (u0 + width * 2, v0 - depth), (u0 + width, v0 - depth)],
-    }
-    mirror = bool(shape.get("texture_mirror", False))
-    if mirror:
-        points["east"], points["west"] = points["west"], points["east"]
-        for key in points:
-            p1, p2, p3, p4 = points[key]
-            points[key] = [p2, p1, p4, p3]
-    # Order each face's UVs to match the loop ordering in `faces` above.
-    loop_points = [
-        [points["north"][2], points["north"][1], points["north"][0], points["north"][3]],
-        [points["south"][2], points["south"][1], points["south"][0], points["south"][3]],
-        [points["west"][2], points["west"][1], points["west"][0], points["west"][3]],
-        [points["east"][2], points["east"][1], points["east"][0], points["east"][3]],
-        [points["up"][0], points["up"][3], points["up"][2], points["up"][1]],
-        [points["down"][3], points["down"][0], points["down"][1], points["down"][2]],
-    ]
-    uv = [(x / tex_w, 1.0 - y / tex_h) for face_points in loop_points for x, y in face_points]
-    return vertices, faces, uv
-
-
-def _plane_geometry(
-    shape: dict[str, Any], texture_size: tuple[float, float]
-) -> tuple[list[tuple[float, float, float]], list[tuple[int, ...]], list[tuple[float, float]]]:
-    """Build a Mine-imator / Modelbench plane on whichever axis it is flat along.
-
-    Delegates to modelgeom.plane_geometry (pure Python, unit-tested outside
-    Blender).  The old implementation assumed the thin axis was always Z, so a
-    plane flat on X or Y collapsed onto a single edge.
-    """
-    vertices, faces, uvs, warnings = modelgeom.plane_geometry(shape, texture_size, core.mi_vector)
-    for warning in warnings:
-        _PLANE_WARNINGS.append(warning)
-    return vertices, faces, uvs
-
-
-_PLANE_WARNINGS: list[str] = []
-
-
-def _resolve_texture(name: Any, model_dir: Path | None, project: core.ProjectIndex, assets: core.AssetStore | None) -> Path | None:
-    if core._is_null(name):
-        return None
-    raw = str(name)
-    direct = Path(raw.replace("/", os.sep))
-    candidates = []
-    if direct.is_absolute():
-        candidates.append(direct)
-    if model_dir:
-        candidates.extend([model_dir / direct, model_dir / direct.name])
-    candidates.extend([project.project_dir / direct, project.project_dir / direct.name])
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    if assets:
-        asset_name = raw
-        if not Path(asset_name).suffix:
-            asset_name = f"textures/{asset_name}.png"
-        resolved = assets.materialize(asset_name)
-        if resolved:
-            return resolved
-    return _mcprep_texture(raw)
-
-
-def _mcprep_texture(name: str) -> Path | None:
-    """Last-resort lookup in MCprep's bundled default resource pack."""
-    raw = str(name).replace("minecraft:", "").replace("\\", "/")
-    raw = raw.removeprefix("textures/")
-    if not Path(raw).suffix:
-        raw += ".png"
-    candidates: list[Path] = []
-    scripts = Path(bpy.utils.user_resource("SCRIPTS"))
-    addon_roots = [scripts / "addons" / "MCprep_addon", scripts / "addons_core" / "MCprep_addon"]
-    for addon_root in addon_roots:
-        pack = addon_root / "MCprep_resources" / "resourcepacks" / "mcprep_default" / "assets" / "minecraft" / "textures"
-        candidates.extend([pack / raw, pack / Path(raw).name])
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    return None
-
-
-_ALPHA_CACHE: dict[str, tuple[tuple[int, int], Any]] = {}
-
-
-def _image_alpha(path: Path) -> tuple[tuple[int, int], Any]:
-    """((width, height), opaque(px, py)) for a texture, (0, 0) = top left.
-
-    Mine-imator treats a pixel as solid only when its alpha is exactly 1.
-    """
-    key = str(path)
-    cached = _ALPHA_CACHE.get(key)
-    if cached is None:
-        image = bpy.data.images.load(key, check_existing=True)
-        width, height = int(image.size[0]), int(image.size[1])
-        try:
-            import numpy as np
-            buffer = np.empty(width * height * 4, dtype=np.float32)
-            image.pixels.foreach_get(buffer)
-            alpha = buffer.reshape(height, width, 4)[::-1, :, 3]  # Blender is bottom-up
-            alpha = alpha >= 0.999
-        except Exception:
-            flat = list(image.pixels[:])
-            alpha = [[flat[((height - 1 - y) * width + x) * 4 + 3] >= 0.999 for x in range(width)] for y in range(height)]
-
-        def opaque(px: int, py: int, _a=alpha, _w=width, _h=height) -> bool:
-            return 0 <= px < _w and 0 <= py < _h and bool(_a[py][px])
-
-        cached = ((width, height), opaque)
-        _ALPHA_CACHE[key] = cached
-    return cached
-
-
-def _voxel_plane_geometry(shape: dict[str, Any], texture_size: tuple[float, float], texture_path: Path):
-    """model_shape_generate_plane_3d: one cube per opaque texel, nothing else."""
-    size, opaque = _image_alpha(texture_path)
-    plane = modelgeom.plane3d_geometry(shape, texture_size, size, opaque, core.mi_vector)
-    return plane.vertices, plane.faces, plane.loop_uvs, plane.voxels
-
-
-def _create_model_shape(name: str, shape: dict[str, Any], texture_size: tuple[float, float], material: bpy.types.Material, collection: bpy.types.Collection, texture_path: Path | None = None) -> bpy.types.Object:
-    shape_type = str(shape.get("type", "block")).lower()
-    texture_size = (max(texture_size), max(texture_size))  # model_file_load_part makes it square
-    voxels = None
-    if shape_type == "plane" and shape.get("3d") and texture_path is not None and texture_path.is_file():
-        try:
-            vertices, faces, uvs, voxels = _voxel_plane_geometry(shape, texture_size, texture_path)
-        except Exception:
-            voxels = None
-    if voxels is None:
-        geometry = _plane_geometry(shape, texture_size) if shape_type == "plane" else _box_geometry(shape, texture_size)
-        vertices, faces, uvs = geometry
-        if shape_type != "plane" and shape.get("invert", False):
-            # Inside-out block (e.g. a mouth cavity): reverse every face and its UVs.
-            faces = [tuple(reversed(face)) for face in faces]
-            uvs = [uv for start in range(0, len(uvs), 4) for uv in reversed(uvs[start:start + 4])]
-    mesh = bpy.data.meshes.new(f"{name} Mesh")
-    mesh.from_pydata(vertices, [], faces)
-    mesh.materials.append(material)
-    uv_layer = mesh.uv_layers.new(name="UVMap")
-    for loop, uv in zip(mesh.loops, uvs):
-        uv_layer.data[loop.index].uv = uv
-    mesh.update()
-    obj = bpy.data.objects.new(name, mesh)
-    collection.objects.link(obj)
-    rotation = _mimodel_rotation_matrix(shape.get("rotation", [0, 0, 0]))
-    location = core.mi_vector(shape.get("position", [0, 0, 0]))
-    scale = list(shape.get("scale", [1, 1, 1]))
-    while len(scale) < 3: scale.append(1)
-    obj.matrix_basis = _transform_matrix(location, rotation, (float(scale[0]), float(scale[2]), float(scale[1])))
-    obj["mi_shape_type"] = shape_type
-    if voxels is not None:
-        obj["mi_3d_plane_voxels"] = voxels
-    return obj
-
-
-def _voxel_skin_geometry(
-    shape: dict[str, Any],
-    texture_size: tuple[float, float],
-    image: bpy.types.Image,
-) -> tuple[list[tuple[float, float, float]], list[tuple[int, ...]], list[tuple[float, float]], int]:
-    """Turn the visible texels of an inflated player layer into a 3D shell.
-
-    Each visible surface texel keeps its exact front UV. Boundary edges extend
-    inward to the uninflated player body, giving transparent gaps real depth
-    without creating hidden faces between adjacent texels.
-    """
-    box_vertices, box_faces, box_uvs = _box_geometry(shape, texture_size)
-    image_width, image_height = image.size
-    if image_width < 1 or image_height < 1:
-        raise ValueError("player skin texture has no pixels")
-    pixels = list(image.pixels[:])
-    vertices: list[tuple[float, float, float]] = []
-    faces: list[tuple[int, int, int, int]] = []
-    uvs: list[tuple[float, float]] = []
-    visible_pixels = 0
-    center = sum((Vector(value) for value in box_vertices), Vector()) / len(box_vertices)
-    # 3D Skin Layers uses one full model texel of depth for each surface
-    # voxel. Mine-imator's ordinary outer shell is only 0.25-0.5 texels away
-    # from the base body, which made the first bridge implementation almost
-    # indistinguishable at normal camera distances.
-    depth = 1.0 / core.MI_UNITS_PER_BLOCK
-    tex_w, tex_h = texture_size
-
-    def bilerp(values, x: float, y: float):
-        low = values[0].lerp(values[1], x)
-        high = values[3].lerp(values[2], x)
-        return low.lerp(high, y)
-
-    def is_visible(uv: Vector) -> bool:
-        # Blender image buffers and the bridge's UVs both use a bottom-left
-        # origin. Clamp exact 1.0 coordinates back onto the last texel.
-        x = min(image_width - 1, max(0, int(math.floor(float(uv.x) * image_width))))
-        y = min(image_height - 1, max(0, int(math.floor(float(uv.y) * image_height))))
-        return pixels[(y * image_width + x) * 4 + 3] > (1.0 / 255.0)
-
-    def add_quad(points: list[Vector], face_uvs: list[Vector]) -> None:
-        base = len(vertices)
-        vertices.extend(tuple(point) for point in points)
-        faces.append((base, base + 1, base + 2, base + 3))
-        uvs.extend((float(uv.x), float(uv.y)) for uv in face_uvs)
-
-    for face_index, face in enumerate(box_faces):
-        points = [Vector(box_vertices[index]) for index in face]
-        face_uv = [Vector(box_uvs[face_index * 4 + index]) for index in range(4)]
-        edge_u = face_uv[1] - face_uv[0]
-        edge_v = face_uv[3] - face_uv[0]
-        columns = max(1, int(round(max(abs(edge_u.x * tex_w), abs(edge_u.y * tex_h)))))
-        rows = max(1, int(round(max(abs(edge_v.x * tex_w), abs(edge_v.y * tex_h)))))
-        occupancy: set[tuple[int, int]] = set()
-        for column in range(columns):
-            for row in range(rows):
-                sample_uv = bilerp(face_uv, (column + 0.5) / columns, (row + 0.5) / rows)
-                if is_visible(sample_uv):
-                    occupancy.add((column, row))
-
-        face_center = sum(points, Vector()) / 4.0
-        normal = (points[1] - points[0]).cross(points[3] - points[0]).normalized()
-        if normal.dot(face_center - center) < 0.0:
-            normal.negate()
-        inward = normal * depth
-        for column, row in sorted(occupancy, key=lambda value: (value[1], value[0])):
-            x0, x1 = column / columns, (column + 1) / columns
-            y0, y1 = row / rows, (row + 1) / rows
-            front = [
-                bilerp(points, x0, y0),
-                bilerp(points, x1, y0),
-                bilerp(points, x1, y1),
-                bilerp(points, x0, y1),
-            ]
-            front_uv = [
-                bilerp(face_uv, x0, y0),
-                bilerp(face_uv, x1, y0),
-                bilerp(face_uv, x1, y1),
-                bilerp(face_uv, x0, y1),
-            ]
-            back = [point - inward for point in front]
-            sample_uv = bilerp(face_uv, (column + 0.5) / columns, (row + 0.5) / rows)
-            solid_uvs = [sample_uv] * 4
-            add_quad(front, front_uv)
-            if (column - 1, row) not in occupancy:
-                add_quad([front[0], front[3], back[3], back[0]], solid_uvs)
-            if (column + 1, row) not in occupancy:
-                add_quad([front[1], back[1], back[2], front[2]], solid_uvs)
-            if (column, row - 1) not in occupancy:
-                add_quad([front[0], back[0], back[1], front[1]], solid_uvs)
-            if (column, row + 1) not in occupancy:
-                add_quad([front[3], front[2], back[2], back[3]], solid_uvs)
-            visible_pixels += 1
-    return vertices, faces, uvs, visible_pixels
-
-
-def _create_voxel_skin_layer(
-    name: str,
-    shape: dict[str, Any],
-    texture_size: tuple[float, float],
-    texture_path: Path,
-    material: bpy.types.Material,
-    collection: bpy.types.Collection,
-) -> bpy.types.Object:
-    image = bpy.data.images.load(str(texture_path), check_existing=True)
-    vertices, faces, uvs, visible_pixels = _voxel_skin_geometry(shape, texture_size, image)
-    mesh = bpy.data.meshes.new(f"{name} 3D Outer Layer Mesh")
-    mesh.from_pydata(vertices, [], faces)
-    mesh.materials.append(material)
-    uv_layer = mesh.uv_layers.new(name="UVMap")
-    for loop, uv in zip(mesh.loops, uvs):
-        uv_layer.data[loop.index].uv = uv
-    mesh.update()
-    obj = bpy.data.objects.new(name, mesh)
-    collection.objects.link(obj)
-    rotation = _mimodel_rotation_matrix(shape.get("rotation", [0, 0, 0]))
-    location = core.mi_vector(shape.get("position", [0, 0, 0]))
-    scale = list(shape.get("scale", [1, 1, 1]))
-    while len(scale) < 3:
-        scale.append(1)
-    obj.matrix_basis = _transform_matrix(location, rotation, (float(scale[0]), float(scale[2]), float(scale[1])))
-    obj["mi_3d_outer_layer"] = True
-    obj["mi_3d_outer_pixels"] = visible_pixels
-    return obj
-
-
-def _build_mimodel(model: dict[str, Any], model_path: Path | None, root: bpy.types.Object, collection: bpy.types.Collection, project: core.ProjectIndex, assets: core.AssetStore | None, texture_override: Path | None, report: ImportReport, outer_layers_3d: bool = False) -> dict[str, list[bpy.types.Object]]:
-    part_map: dict[str, list[bpy.types.Object]] = defaultdict(list)
-    base_size = model.get("texture_size", [64, 64])
-    if not isinstance(base_size, list) or len(base_size) < 2:
-        base_size = [64, 64]
-    material_cache: dict[str, bpy.types.Material] = {}
-
-    def texture_path_for(texture: Any, explicit: bool = False) -> Path | None:
-        """The template's model texture replaces only the model's *default* texture;
-        a part or shape that names its own texture (e.g. a ponytail) keeps it."""
-        if texture_override and not explicit:
-            return texture_override
-        resolved = _resolve_texture(texture, model_path.parent if model_path else None, project, assets)
-        return resolved or texture_override
-
-    def material_for(texture_path: Path | None, blend: tuple[float, float, float], alpha: float,
-                     mix: tuple[float, float, float], mix_percent: float, cull: bool = False) -> bpy.types.Material:
-        key = f"{texture_path}|{blend}|{alpha}|{mix}|{mix_percent}|{cull}"
-        if key not in material_cache:
-            tint = scenemath.color_linear(blend)
-            mix_lin = scenemath.color_linear(mix)
-            if texture_path:
-                base = (1.0, 1.0, 1.0, alpha)
-            else:
-                base = tuple(c * (1 - mix_percent) + m * mix_percent for c, m in zip(tint, mix_lin)) + (alpha,)
-            material = _new_material(f"MI {Path(str(texture_path)).stem if texture_path else 'Color'}", texture_path, base)
-            if texture_path:
-                _apply_color_nodes(material, tint, mix_lin, mix_percent)
-            material.use_backface_culling = cull   # inverted blocks must only show from inside
-            material_cache[key] = material
-        return material_cache[key]
-
-    ColorState = tuple  # (blend rgb, alpha, mix rgb, mix percent)
-
-    def color_state(node: dict[str, Any], parent: ColorState) -> ColorState:
-        """model_file_load_part / _shape: color_blend multiplies, alpha multiplies,
-        color_mix adds and color_mix_percent adds (clamped) when color_inherit."""
-        blend = scenemath.parse_hex(node.get("color_blend"))
-        legacy = scenemath.parse_hex(node.get("color"))
-        blend = tuple(a * b for a, b in zip(blend, legacy))
-        alpha = float(node.get("color_alpha", 1.0))
-        mix = scenemath.parse_hex(node.get("color_mix"), scenemath.BLACK)
-        percent = float(node.get("color_mix_percent", 0.0))
-        if bool(node.get("color_inherit", True)):
-            blend = tuple(a * b for a, b in zip(blend, parent[0]))
-            alpha *= parent[1]
-            mix = tuple(min(1.0, a + b) for a, b in zip(mix, parent[2]))
-            percent = min(1.0, max(0.0, percent + parent[3]))
-        return (blend, alpha, mix, percent)
-
-    def visit(parts: list[dict[str, Any]], parent: bpy.types.Object, inherited_texture: Any, inherited_size: list[float], path: str, inherited_color: ColorState, inherited_explicit: bool = False) -> None:
-        for part_index, part in enumerate(parts):
-            part_name = str(part.get("name") or f"part_{part_index}")
-            pivot = _new_empty(part_name, collection)
-            pivot.parent = parent
-            location = core.mi_vector(part.get("position", [0, 0, 0]))
-            rotation = _mimodel_rotation_matrix(part.get("rotation", [0, 0, 0]))
-            scale = list(part.get("scale", [1, 1, 1]))
-            while len(scale) < 3: scale.append(1)
-            pivot.matrix_basis = _transform_matrix(location, rotation, (scale[0], scale[2], scale[1]))
-            pivot["mi_model_part"] = part_name
-            pivot["mi_model_part_path"] = f"{path}/{part_name}"
-            pivot["mi_lock_bend"] = bool(part.get("lock_bend", True))
-            pivot["mi_render_depth"] = int(part.get("depth", 0) or 0)
-            bend = part.get("bend")
-            if bend:
-                pivot["mi_bend_definition"] = json.dumps(bend, separators=(",", ":"))
-            part_map[part_name].append(pivot)
-            part_texture = part.get("texture", inherited_texture)
-            part_explicit = inherited_explicit or ("texture" in part)
-            part_size = part.get("texture_size", inherited_size)
-            if not isinstance(part_size, list) or len(part_size) < 2:
-                part_size = inherited_size
-            part_color = color_state(part, inherited_color)
-            for shape_index, shape in enumerate(part.get("shapes", [])):
-                shape_name = str(shape.get("description") or f"{part_name}_shape_{shape_index + 1}")
-                blend, alpha, mix, mix_percent = color_state(shape, part_color)
-                texture = shape.get("texture", part_texture)
-                shape_size = shape.get("texture_size", part_size)
-                texture_path = texture_path_for(texture, part_explicit or ("texture" in shape))
-                material = material_for(texture_path, blend, alpha, mix, mix_percent, bool(shape.get("invert", False)) and str(shape.get("type", "block")).lower() != "plane")
-                voxelize = (
-                    outer_layers_3d
-                    and bool(model.get("player_skin"))
-                    and str(shape.get("type", "block")).lower() == "block"
-                    and float(shape.get("inflate", 0.0)) > 0.0
-                    and texture_path is not None
-                )
-                if voxelize:
-                    obj = _create_voxel_skin_layer(shape_name, shape, tuple(shape_size[:2]), texture_path, material, collection)
-                    report.created["3d_outer_layer"] += 1
-                    report.created["3d_outer_pixel"] += int(obj.get("mi_3d_outer_pixels", 0))
-                else:
-                    obj = _create_model_shape(shape_name, shape, tuple(shape_size[:2]), material, collection, texture_path)
-                    if outer_layers_3d and bool(model.get("player_skin")) and float(shape.get("inflate", 0.0)) > 0.0 and texture_path is None:
-                        report.fallbacks.append(f"{root.name}/{shape_name}: 3D outer layer needs a readable skin texture; kept the flat layer")
-                obj.parent = pivot
-                obj.hide_render = alpha <= 0
-                report.created[f"model_{str(shape.get('type', 'block')).lower()}"] += 1
-                if obj.get("mi_3d_plane_voxels") is not None:
-                    report.created["model_3d_plane"] += 1
-                    report.created["model_3d_plane_voxel"] += int(obj["mi_3d_plane_voxels"])
-            visit(part.get("parts", []), pivot, part_texture, part_size, f"{path}/{part_name}", part_color, part_explicit)
-
-    _PLANE_WARNINGS.clear()
-    visit(model.get("parts", []), root, model.get("texture", "default"), base_size, "", ((1.0, 1.0, 1.0), 1.0, (0.0, 0.0, 0.0), 0.0))
-    for warning in sorted(set(_PLANE_WARNINGS)):
-        report.fallbacks.append(f"{root.name}: {warning}")
-    _PLANE_WARNINGS.clear()
-    return part_map
-
-
-def _matrix_rows(matrix: Matrix) -> tuple[tuple[float, float, float, float], ...]:
-    return tuple(tuple(float(value) for value in row) for row in matrix)
-
-
-def _world_matrix(obj: bpy.types.Object) -> Matrix:
-    """matrix_world computed from the parent chain (does not need a depsgraph update)."""
-    chain = []
-    current = obj
-    while current is not None:
-        chain.append(current)
-        current = current.parent
-    world = Matrix.Identity(4)
-    for node in reversed(chain):
-        if node.parent is None:
-            world = node.matrix_basis.copy()
-        else:
-            world = world @ node.matrix_parent_inverse @ node.matrix_basis
-    return world
-
-
-def _slice_and_weight(child: bpy.types.Object, spec: "modelgeom.BendSpec", pivot: Vector, axis_vec: Vector,
-                      axis_index: int, note, eased: bool = False, rotation: Matrix | None = None,
-                      rotation_pivot: Vector | None = None) -> bool:
-    """Slice a shape across the bend region and give it a bend vertex group.
-
-    Returns True when at least one vertex is influenced by the bend.
-    """
-    matrix = child.matrix_basis.copy()
-    if abs(matrix.determinant()) < 1e-18:
-        note(f"shape {child.name} has a zero-scale axis; bend skipped")
-        return False
-    inverse = matrix.inverted()
-    mesh = child.data
-    if mesh.users > 1:  # never edit a mesh other objects share
-        mesh = mesh.copy()
-        child.data = mesh
-    local_normal = matrix.to_3x3().transposed() @ axis_vec
-    if local_normal.length > 1e-12:
-        local_normal.normalize()
-        bm = bmesh.new()
-        bm.from_mesh(mesh)
-        for coordinate in spec.cut_positions():
-            plane_point = pivot.copy()
-            plane_point[axis_index] = coordinate
-            bm.verts.ensure_lookup_table()
-            bmesh.ops.bisect_plane(
-                bm,
-                geom=list(bm.verts) + list(bm.edges) + list(bm.faces),
-                plane_co=inverse @ plane_point,
-                plane_no=local_normal,
-                clear_inner=False,
-                clear_outer=False,
-                dist=1e-7,
-            )
-        bm.to_mesh(mesh)
-        bm.free()
-        mesh.update()
-    weights = [(vertex.index, spec.weight((matrix @ vertex.co)[axis_index], eased)) for vertex in mesh.vertices]
-    influenced = [(index, weight) for index, weight in weights if weight > 1e-6]
-    if not influenced:
-        return False
-    if rotation is not None and rotation_pivot is not None:
-        # Guard: linear blend skinning moves a vertex by at most |R - I| times its distance
-        # from the pivot.  If that is out of proportion to the shape, leave it unbent.
-        points = [matrix @ vertex.co for vertex in mesh.vertices]
-        lows = [min(p[i] for p in points) for i in range(3)]
-        highs = [max(p[i] for p in points) for i in range(3)]
-        diagonal = math.sqrt(sum((highs[i] - lows[i]) ** 2 for i in range(3)))
-        weight_of = dict(influenced)
-        worst = 0.0
-        for vertex, point in zip(mesh.vertices, points):
-            w = weight_of.get(vertex.index, 0.0)
-            if w > 0.0:
-                moved = rotation_pivot + rotation @ (point - rotation_pivot)
-                worst = max(worst, w * (moved - point).length)
-        if not math.isfinite(worst) or worst > 2.0 * diagonal + 0.25:
-            note(f"bend on {child.name} would move it {worst:.2f} blocks (shape is {diagonal:.2f}); left unbent")
-            return False
-    group = child.vertex_groups.get(BEND_BONE_NAME) or child.vertex_groups.new(name=BEND_BONE_NAME)
-    for index, weight in influenced:
-        group.add([index], min(1.0, weight), "REPLACE")
-    return True
-
-
-def _make_bend_rig(part_obj: bpy.types.Object, meshes: list[bpy.types.Object], pivot: Vector,
-                   rotation: Matrix, label: str, note) -> bpy.types.Object | None:
-    """One armature, one bone at the bend pivot, posed with the frame-0 bend.
-
-    Mine-imator rotates every vertex by (bend angle x weight).  Linear blend
-    skinning with the same 0..1 weights reproduces that closely and leaves a
-    single bone you can rotate to pose or animate the bend.
-    """
-    collection = part_obj.users_collection[0] if part_obj.users_collection else bpy.context.scene.collection
-    arm_data = bpy.data.armatures.new(f"{label} Bend")
-    arm_obj = bpy.data.objects.new(f"{label} Bend", arm_data)
-    collection.objects.link(arm_obj)
-    arm_obj.parent = part_obj  # identity local transform: bone space == part space
-    arm_data.display_type = "STICK"
-    arm_obj.show_in_front = True
-    view_layer = bpy.context.view_layer
-    previous = view_layer.objects.active
-    try:
-        view_layer.objects.active = arm_obj
-        bpy.ops.object.mode_set(mode="EDIT")
-        try:
-            bone = arm_data.edit_bones.new(BEND_BONE_NAME)
-            bone.head = pivot
-            bone.tail = pivot + Vector((0.0, 0.25, 0.0))  # along +Y, roll 0 => bone axes == part axes
-            bone.roll = 0.0
-        finally:
-            bpy.ops.object.mode_set(mode="OBJECT")
-        pose_bone = arm_obj.pose.bones[BEND_BONE_NAME]
-        pose_bone.rotation_mode = "QUATERNION"
-        pose_bone.rotation_quaternion = rotation.to_quaternion()
-    except Exception as exc:  # leave the meshes unbent rather than half-built
-        note(f"could not build the bend rig ({type(exc).__name__}: {exc}); part left unbent")
-        bpy.data.objects.remove(arm_obj, do_unlink=True)
-        bpy.data.armatures.remove(arm_data)
-        return None
-    finally:
-        if previous is not None:
-            try:
-                view_layer.objects.active = previous
-            except Exception:
-                pass
-    for mesh_obj in meshes:
-        modifier = mesh_obj.modifiers.new(name=BEND_BONE_NAME, type="ARMATURE")
-        modifier.object = arm_obj
-        modifier.use_vertex_groups = True
-    arm_obj["mi_bend_part"] = label
-    arm_obj["mi_bend_pivot"] = [float(c) for c in pivot]
-    arm_obj["mi_bend_rotation"] = [[float(c) for c in row] for row in rotation.to_3x3()]
-    return arm_obj
-
-
-def _apply_model_bend(part_obj: bpy.types.Object, state: dict[str, Any], report: "ImportReport | None" = None) -> None:
-    """Recreate Mine-imator's model-part bend with an armature.
-
-    The original (model_shape_generate_block) slices each block along the bend
-    axis and rotates every slice by angle x weight, where weight ramps 0..1
-    across `size` (default 4 units) and is inverted for lower/back/left.  Here
-    the same weights become a vertex group driven by one bone at the pivot.
-    Math is in modelgeom.BendSpec (unit-tested outside Blender).  Child parts
-    follow the bend as a static offset.
-    """
-    raw = part_obj.get("mi_bend_definition")
-    if not raw:
-        return
-    try:
-        definition = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        return
-    if not isinstance(definition, dict):
-        return
-    spec = modelgeom.BendSpec.from_definition(definition, core.MI_UNITS_PER_BLOCK)
-    angles = spec.engine_angles(state)
-    if not any(abs(value) > 1e-8 for value in angles) and not ALWAYS_CREATE_BEND_RIGS:
-        return
-
-    axis_index, pivot_value, _positive = spec.axis_and_pivot()
-    pivot = Vector((0.0, 0.0, 0.0))
-    pivot[axis_index] = pivot_value
-    axis_vec = Vector((0.0, 0.0, 0.0))
-    axis_vec[axis_index] = 1.0
-    part_label = part_obj.get("mi_model_part_path", part_obj.name)
-
-    def note(message: str) -> None:
-        if report is not None:
-            report.fallbacks.append(f"{part_label}: {message}")
-
-    full_rotation = Matrix(spec.bone_rotation(angles))
-    eased = modelgeom.BendSpec.uses_easing(angles)  # model_shape_get_bend: X/Y eased, Z linear
-    rigged: list[bpy.types.Object] = []
-    for child in list(part_obj.children):
-        if child.type == "MESH":
-            try:
-                # Planes are sliced along Z even for front/back bends.
-                use_spec = spec.plane_variant() if child.get("mi_shape_type") == "plane" else spec
-                use_axis, use_pivot_value, _ = use_spec.axis_and_pivot()
-                use_pivot = Vector((0.0, 0.0, 0.0))
-                use_pivot[use_axis] = use_pivot_value
-                use_axis_vec = Vector((0.0, 0.0, 0.0))
-                use_axis_vec[use_axis] = 1.0
-                if _slice_and_weight(child, use_spec, use_pivot, use_axis_vec, use_axis, note, eased, full_rotation, pivot):
-                    rigged.append(child)
-            except Exception as exc:
-                note(f"bend weights failed on {child.name} ({type(exc).__name__}: {exc})")
-        elif child.type == "EMPTY":
-            # Child parts with lock_bend follow the bend by the full angle about the pivot.
-            if child.get("mi_lock_bend", True) and any(abs(value) > 1e-8 for value in angles):
-                child.matrix_basis = Matrix.Translation(pivot) @ full_rotation.to_4x4() @ Matrix.Translation(-pivot) @ child.matrix_basis
-    if rigged:
-        if _make_bend_rig(part_obj, rigged, pivot, full_rotation, str(part_label), note) is not None and report is not None:
-            report.created["bend_rig"] += 1
-
-
-def _model_definition(template: dict[str, Any], project: core.ProjectIndex, assets: core.AssetStore | None) -> tuple[dict[str, Any] | None, Path | None, Path | None, str | None]:
-    template_type = str(template.get("type", ""))
-    texture_override = None
-    texture_resource = project.resource(template.get("model_tex"))
-    if texture_resource:
-        texture_override = core.project_resource_path(project, texture_resource)
-    if template_type == "model":
-        resource = project.resource(template.get("model"))
-        path = core.project_resource_path(project, resource)
-        if path:
-            return core.load_mimodel(path), path, texture_override, None
-        return None, path, texture_override, "custom .mimodel resource is missing"
-    if not assets:
-        return None, None, texture_override, "Mine-imator asset pack is unavailable"
-    model_spec = template.get("model", {})
-    if not isinstance(model_spec, dict):
-        return None, None, texture_override, "template has no model definition"
-    name = model_spec.get("name")
-    category = "characters" if template_type in {"char", "entity"} else "special_blocks"
-    record = assets.find_record(category, name)
-    if not record:
-        return None, None, texture_override, f"asset definition not found for {name}"
-    state = model_spec.get("state", {}) if isinstance(model_spec.get("state"), dict) else {}
-    filename = record.get("file")
-    for state_name, choices in record.get("states", {}).items():
-        wanted = str(state.get(state_name, ""))
-        for choice in choices:
-            if str(choice.get("value")) == wanted and choice.get("file"):
-                filename = choice["file"]
-    if not filename:
-        return None, None, texture_override, f"asset definition for {name} has no model file"
-    model_path = assets.materialize(str(filename))
-    if not model_path:
-        return None, None, texture_override, f"model file {filename} is absent from asset pack"
-    model = core.load_mimodel(model_path)
-    if not texture_override:
-        for state_name, choices in record.get("states", {}).items():
-            wanted = str(state.get(state_name, ""))
-            for choice in choices:
-                if str(choice.get("value")) != wanted:
-                    continue
-                texture = choice.get("shape_texture")
-                if isinstance(texture, dict):
-                    texture = texture.get(str(state.get("type", "wide"))) or next(iter(texture.values()), None)
-                if texture:
-                    texture_override = assets.materialize(f"textures/{texture}.png")
-    return model, model_path, texture_override, None
-
-
-def _pixel_item(
-    name: str,
-    image_path: Path,
-    collection: bpy.types.Collection,
-    report: ImportReport,
-    rotation_point: Any = (8.0, 0.0, 0.5),
-) -> bpy.types.Object:
-    """Build Mine-imator's one-unit item slab around its saved pivot.
-
-    Blender exposes image pixels bottom-up.  Mine-imator's item buffer maps
-    that bottom row to local Z=0 and uses a fixed one-MI-unit depth, regardless
-    of texture resolution.  Building only boundary side faces avoids both the
-    scrambled per-pixel UVs and the thousands of hidden internal faces from
-    the previous cube-per-pixel approximation.
-    """
-    image = bpy.data.images.load(str(image_path), check_existing=True)
-    width, height = image.size
-    pixels = list(image.pixels[:])
-    opaque: set[tuple[int, int]] = set()
-    for y in range(height):
-        for x in range(width):
-            if pixels[(y * width + x) * 4 + 3] > 0.01:
-                opaque.add((x, y))
-    if not opaque:
-        raise ValueError("item texture contains no visible pixels")
-    vertices: list[tuple[float, float, float]] = []
-    faces: list[tuple[int, int, int, int]] = []
-    uvs: list[tuple[float, float]] = []
-    point = list(rotation_point) if isinstance(rotation_point, (list, tuple)) else [8.0, 0.0, 0.5]
-    point = (point + [0.0, 0.0, 0.5])[:3]
-    pivot = Vector(core.mi_vector(point))
-    size_x = 1.0
-    size_z = height / width if width > height else 1.0
-    if height > width:
-        size_x = width / height
-    front_y = -1.0 / core.MI_UNITS_PER_BLOCK - pivot.y
-    back_y = -pivot.y
-
-    def add_quad(coords: list[tuple[float, float, float]], face_uvs: list[tuple[float, float]]) -> None:
-        base = len(vertices)
-        vertices.extend(coords)
-        faces.append((base, base + 1, base + 2, base + 3))
-        uvs.extend(face_uvs)
-
-    for x, y in sorted(opaque, key=lambda value: (value[1], value[0])):
-        x0 = x / width * size_x - pivot.x
-        x1 = (x + 1) / width * size_x - pivot.x
-        z0 = y / height * size_z - pivot.z
-        z1 = (y + 1) / height * size_z - pivot.z
-        yf = front_y
-        yb = back_y
-        u0, u1 = x / width, (x + 1) / width
-        v0, v1 = y / height, (y + 1) / height
-        center_u, center_v = (u0 + u1) / 2.0, (v0 + v1) / 2.0
-
-        add_quad([(x0, yf, z0), (x1, yf, z0), (x1, yf, z1), (x0, yf, z1)], [(u0, v0), (u1, v0), (u1, v1), (u0, v1)])
-        add_quad([(x1, yb, z0), (x0, yb, z0), (x0, yb, z1), (x1, yb, z1)], [(u1, v0), (u0, v0), (u0, v1), (u1, v1)])
-        if (x - 1, y) not in opaque:
-            add_quad([(x0, yb, z0), (x0, yf, z0), (x0, yf, z1), (x0, yb, z1)], [(center_u, v0), (center_u, v0), (center_u, v1), (center_u, v1)])
-        if (x + 1, y) not in opaque:
-            add_quad([(x1, yf, z0), (x1, yb, z0), (x1, yb, z1), (x1, yf, z1)], [(center_u, v0), (center_u, v0), (center_u, v1), (center_u, v1)])
-        if (x, y - 1) not in opaque:
-            add_quad([(x0, yf, z0), (x0, yb, z0), (x1, yb, z0), (x1, yf, z0)], [(u0, center_v), (u0, center_v), (u1, center_v), (u1, center_v)])
-        if (x, y + 1) not in opaque:
-            add_quad([(x0, yb, z1), (x0, yf, z1), (x1, yf, z1), (x1, yb, z1)], [(u0, center_v), (u0, center_v), (u1, center_v), (u1, center_v)])
-
-    mesh = bpy.data.meshes.new(f"{name} Mesh")
-    mesh.from_pydata(vertices, [], faces)
-    material = _new_material(f"MI Item {image_path.stem}", image_path)
-    mesh.materials.append(material)
-    uv_layer = mesh.uv_layers.new(name="UVMap")
-    for loop, uv in zip(mesh.loops, uvs):
-        uv_layer.data[loop.index].uv = uv
-    obj = bpy.data.objects.new(name, mesh)
-    collection.objects.link(obj)
-    report.created["item_mesh"] += 1
-    return obj
-
-
-class SceneImporter:
-    def __init__(self, context: bpy.types.Context, project: core.ProjectIndex, options: ImportOptions):
-        self.context = context
-        self.project = project
-        self.options = options
-        self.report = ImportReport(project_path=str(project.path))
-        self.assets: core.AssetStore | None = None
-        self.root_collection: bpy.types.Collection | None = None
-        self.collections: dict[str, bpy.types.Collection] = {}
-        self.timeline_objects: dict[str, bpy.types.Object] = {}
-
-    def prepare_assets(self) -> None:
-        install = core.find_mineimator_install(self.project.path, self.options.mineimator_path)
-        asset_path = Path(self.options.asset_pack_path) if self.options.asset_pack_path else None
-        if asset_path and asset_path.is_file() and asset_path.suffix.lower() == ".zip":
-            metadata_path = asset_path.with_suffix(".midata")
-            if metadata_path.is_file():
-                try:
-                    base = install or asset_path.parent
-                    self.assets = core.AssetStore.open_paths(base, asset_path.stem, metadata_path, asset_path)
-                    self.report.notes.append(f"Mine-imator assets: {self.assets.asset_version} ({self.assets.zip_path})")
-                    return
-                except core.BridgeError as exc:
-                    self.report.missing.append(str(exc))
-        if not install:
-            self.report.missing.append("Mine-imator installation not found; bundled characters and special blocks will use placeholders")
-            return
-        try:
-            self.assets = core.AssetStore.open(install)
-            self.report.notes.append(f"Mine-imator assets: {self.assets.asset_version} ({self.assets.zip_path})")
-        except core.BridgeError as exc:
-            self.report.missing.append(str(exc))
-
-    def create_collections(self) -> None:
-        base = f"Mine-imator - {self.project.name}"
-        name = core.unique_name(base, bpy.data.collections.keys())
-        self.root_collection = bpy.data.collections.new(name)
-        self.context.scene.collection.children.link(self.root_collection)
-        self.root_collection["mi_bridge_version"] = core.ADDON_VERSION
-        self.root_collection["mi_source_project"] = str(self.project.path)
-        self.root_collection["mi_created_in"] = self.project.created_in
-        self.root_collection["mi_3d_outer_layers"] = self.options.outer_layers_3d
-        self.context.scene["mi_bridge_last_import_collection"] = name
-        self.report.collection_name = name
-        for key, label in CATEGORY_NAMES.items():
-            if key in self.options.categories:
-                child = bpy.data.collections.new(label)
-                self.root_collection.children.link(child)
-                self.collections[key] = child
-
-    def import_scene(self) -> ImportReport:
-        self.prepare_assets()
-        if self.options.outer_layers_3d:
-            self.report.notes.append("3D character outer layers: enabled for player-skin hats, jackets, sleeves, and pants")
-        if self.options.remove_startup_cube:
-            _remove_untouched_startup_cube(self.context, self.report)
-        self.create_collections()
-        for timeline in self.project.root_timelines():
-            timeline_type = str(timeline.get("type", "")).lower()
-            if timeline_type == "audio":
-                self.report.skipped["audio"] += 1
-                continue
-            category = TYPE_CATEGORY.get(timeline_type)
-            if not category:
-                category = "helpers"
-            if category not in self.options.categories:
-                self.report.skipped[category] += 1
-                continue
-            self.report.imported[timeline_type] += 1
-            try:
-                obj = self._import_root(timeline, category)
-                if obj:
-                    self.timeline_objects[str(timeline.get("id"))] = obj
-                    if timeline_type not in MODEL_TYPES:
-                        self._attach_children(timeline, obj, self.collections[category])
-            except Exception as exc:
-                label = timeline.get("name") or timeline_type or timeline.get("id")
-                self.report.fallbacks.append(f"{label}: {type(exc).__name__}: {exc}")
-                obj = _placeholder(str(label), str(exc), self.collections[category], self.project, timeline, self.report)
-                self.timeline_objects[str(timeline.get("id"))] = obj
-        self._apply_parenting()
-        self._audit_world_size()
-        if self.report.created.get("bend_rig"):
-            self.report.notes.append(f"Bends: {self.report.created['bend_rig']} armature rig(s) ('{BEND_BONE_NAME}' bone) approximate Mine-imator's per-slice bend")
-        if any(self.report.created.get(kind) for kind in shapegen.SHAPE_KINDS):
-            self.report.notes.append("Shapes: generated from Mine-imator's vbuffer algorithms; one block per unit of scale, pivot = saved rotation point")
-        if self.report.created.get("inherit_stripped"):
-            self.report.notes.append(f"Inheritance: {self.report.created['inherit_stripped']} object(s) ignore parent scale/rotation/position (inherit flags)")
-        self._environment()
-        self._mcprep_materials()
-        self._ensure_static()
-        if self.options.outer_layers_3d:
-            self.context.scene["mi_bridge_last_3d_outer_layer_count"] = int(self.report.created["3d_outer_layer"])
-        write_report(self.report)
-        return self.report
-
-    def _import_root(self, timeline: dict[str, Any], category: str) -> bpy.types.Object | None:
-        timeline_type = str(timeline.get("type", "")).lower()
-        template = self.project.template_for_timeline(timeline)
-        collection = self.collections[category]
-        if timeline_type in {"char", "entity", "model", "spblock"}:
-            return self._import_model(timeline, template, collection)
-        if timeline_type == "item":
-            return self._import_item(timeline, template, collection)
-        if timeline_type == "block":
-            return self._import_block(timeline, template, collection)
-        if timeline_type in {"pointlight", "spotlight", "spot_light"}:
-            return self._import_light(timeline, collection)
-        if timeline_type == "camera":
-            return self._import_camera(timeline, collection)
-        if timeline_type == "scenery":
-            return self._import_scenery(timeline, template, collection)
-        if timeline_type == "text":
-            return self._import_text(timeline, template, collection)
-        if timeline_type in {"cube", "cone", "cylinder", "sphere", "surface"}:
-            return self._import_shape(timeline, timeline_type, collection)
-        if timeline_type in {"particle", "particle_spawner"}:
-            return _placeholder(timeline.get("name") or "Particle Spawner", "particle simulation is outside the static bridge scope", collection, self.project, timeline, self.report)
-        if timeline_type == "path":
-            return self._import_path(timeline, collection)
-        obj = _new_empty(timeline.get("name") or timeline_type.title() or "Helper", collection)
-        _apply_transform(obj, core.frame0_state(timeline))
-        _metadata(obj, self.project, timeline, template)
-        self.report.created["helper"] += 1
-        return obj
-
-    def _import_model(self, timeline: dict[str, Any], template: dict[str, Any] | None, collection: bpy.types.Collection,
-                      parent_obj: bpy.types.Object | None = None, local_prefix: Matrix | None = None) -> bpy.types.Object:
-        label = timeline.get("name") or (template or {}).get("name") or str(timeline.get("type", "Model")).title()
-
-        def placeholder(message: str) -> bpy.types.Object:
-            obj = _placeholder(label, message, collection, self.project, timeline, self.report)
-            if local_prefix is not None:
-                obj.matrix_basis = local_prefix @ obj.matrix_basis
-            if parent_obj is not None:
-                self._parent_to(obj, parent_obj, timeline)
-            self._build_stand_in(timeline, obj, collection)
-            return obj
-
-        if not template:
-            return placeholder("timeline template is missing")
-        model, model_path, texture, error = _model_definition(template, self.project, self.assets)
-        if not model:
-            self.report.missing.append(f"{label}: {error}")
-            return placeholder(error or "model not found")
-        state = core.frame0_state(timeline)
-        texture_resource = self.project.resource(state.get("TEXTURE_OBJ"))
-        if texture_resource:
-            instance_texture = core.project_resource_path(self.project, texture_resource)
-            if instance_texture and instance_texture.is_file():
-                texture = instance_texture
-            else:
-                self.report.missing.append(f"{label}: frame-0 texture resource is missing")
-        root = _new_empty(label, collection)
-        _apply_transform(root, state)
-        if local_prefix is not None:
-            root.matrix_basis = local_prefix @ root.matrix_basis
-        _metadata(root, self.project, timeline, template, model_path)
-        if parent_obj is not None:
-            self._parent_to(root, parent_obj, timeline)
-            self._apply_visibility(root, self._style(timeline))
-        part_map = _build_mimodel(
-            model,
-            model_path,
-            root,
-            collection,
-            self.project,
-            self.assets,
-            texture,
-            self.report,
-            outer_layers_3d=self.options.outer_layers_3d,
-        )
-        # Only this model's own bodyparts. Walking every descendant leaked a
-        # nested model's parts (same part names) into the outer model.
-        bodyparts = scenemath.model_bodyparts(self.project, str(timeline.get("id")))
-        placed: list[tuple[dict[str, Any], bpy.types.Object]] = []
-        for bodypart in bodyparts:
-            part_name = str(bodypart.get("model_part_name", ""))
-            candidates = part_map.get(part_name, [])
-            if not candidates:
-                self.report.fallbacks.append(f"{label}: body part {part_name} was not present in model")
-                continue
-            part_obj = candidates[0]
-            state = core.frame0_state(bodypart)
-            default_matrix = part_obj.matrix_basis.copy()
-            state_matrix = _transform_matrix(
-                core.mi_position(state),
-                _engine_rotation_matrix(state),
-                core.mi_scale(state),
-            )
-            # Mine-imator multiplies each timeline transform after the model
-            # part's built-in transform. Matrix composition is essential here;
-            # adding Euler components gives visibly wrong arm/head poses.
-            part_obj.matrix_basis = default_matrix @ state_matrix
-            # inherit.scale/rotation/position = false: drop that part of the parent.
-            self._apply_inherit(part_obj, bodypart)
-            _apply_model_bend(part_obj, state, self.report)
-            part_obj["mi_timeline_id"] = str(bodypart.get("id", ""))
-            part_obj["mi_bend_frame0"] = json.dumps([state.get("BEND_ANGLE_X", 0), state.get("BEND_ANGLE_Y", 0), state.get("BEND_ANGLE_Z", 0)])
-            self.timeline_objects[str(bodypart.get("id"))] = part_obj
-            placed.append((bodypart, part_obj))
-        # Folders, shapes and nested models hang off the model or a bodypart.
-        # Attached after the bends so the bend rigs only ever see model geometry.
-        self._attach_children(timeline, root, collection)
-        for bodypart, part_obj in placed:
-            self._attach_children(bodypart, part_obj, collection)
-        self.report.created["model_root"] += 1
-        return root
-
-    def _audit_world_size(self, max_blocks: float = 3.5, max_distance: float = 14.0) -> None:
-        """List meshes that end up unusually large or far from the origin.
-
-        The report names them (with their local scale), which is the quickest way to
-        pin down a misplaced shape without guessing.
-        """
-        try:
-            bpy.context.view_layer.update()
-        except Exception:
-            return
-        flagged: list[str] = []
-        for collection in self.collections.values():
-            for obj in collection.all_objects:
-                if obj.type != "MESH" or len(obj.data.vertices) < 2:
-                    continue
-                corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
-                lows = [min(c[i] for c in corners) for i in range(3)]
-                highs = [max(c[i] for c in corners) for i in range(3)]
-                size = max(highs[i] - lows[i] for i in range(3))
-                center = [(lows[i] + highs[i]) * 0.5 for i in range(3)]
-                if size > max_blocks or math.sqrt(sum(c * c for c in center)) > max_distance:
-                    scale = obj.matrix_basis.to_scale()
-                    flagged.append(
-                        f"audit: '{obj.name}' (parent '{obj.parent.name if obj.parent else '-'}') spans {size:.1f} blocks at "
-                        f"({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}), local scale ({scale[0]:.3f}, {scale[1]:.3f}, {scale[2]:.3f})"
-                    )
-        self.report.fallbacks.extend(flagged[:15])
-        if len(flagged) > 15:
-            self.report.fallbacks.append(f"audit: ... and {len(flagged) - 15} more oversized/far objects")
-
-    def _build_stand_in(self, timeline: dict[str, Any], root: bpy.types.Object, collection: bpy.types.Collection) -> None:
-        """Keep a missing model's structure so what hangs off it is not lost.
-
-        Its bodyparts become plain empties (frame-0 timeline transform only; the
-        model part's built-in transform is unknown without the file) and every
-        folder, shape and nested model attached to it is still imported.
-        """
-        label = timeline.get("name") or "model"
-        stand_ins: list[tuple[dict[str, Any], bpy.types.Object]] = []
-        queue: list[tuple[dict[str, Any], bpy.types.Object]] = [(timeline, root)]
-        while queue:
-            parent_timeline, parent_obj = queue.pop(0)
-            for child in self.project.children(str(parent_timeline.get("id"))):
-                if str(child.get("type", "")).lower() != "bodypart":
-                    continue
-                obj = _new_empty(child.get("name") or child.get("model_part_name") or "Part", collection)
-                _apply_transform(obj, core.frame0_state(child))
-                self._parent_to(obj, parent_obj, child)
-                self.timeline_objects[str(child.get("id"))] = obj
-                stand_ins.append((child, obj))
-                queue.append((child, obj))
-        self._attach_children(timeline, root, collection)
-        for bodypart, obj in stand_ins:
-            self._attach_children(bodypart, obj, collection)
-        self.report.fallbacks.append(
-            f"{label}: model file missing; its {len(stand_ins)} body part(s) became empties, attached shapes/folders/models were kept"
-        )
-
-    # -- hierarchy helpers ---------------------------------------------------
-
-    def _style(self, timeline: dict[str, Any]) -> "scenemath.Style":
-        cache = self.__dict__.setdefault("_style_cache", {})
-        return scenemath.resolve_style(self.project, timeline, cache)
-
-    def _apply_visibility(self, obj: bpy.types.Object, style: "scenemath.Style") -> None:
-        hidden = (not style.visible) or style.alpha <= 0.0
-        obj.hide_viewport = hidden
-        obj.hide_render = hidden
-
-    def _apply_inherit(self, obj: bpy.types.Object, timeline: dict[str, Any]) -> None:
-        """Honour inherit.position/rotation/scale = false via matrix_parent_inverse."""
-        inherit = scenemath.Inherit.of(timeline)
-        if not inherit.transforms_stripped or obj.parent is None:
-            return
-        try:
-            obj.matrix_parent_inverse = Matrix(scenemath.parent_inverse_for(_matrix_rows(_world_matrix(obj.parent)), inherit))
-        except ValueError:
-            self.report.fallbacks.append(f"{obj.name}: parent matrix is singular; inheritance flags ignored")
-            return
-        self.report.created["inherit_stripped"] += 1
-
-    def _parent_to(self, obj: bpy.types.Object, parent_obj: bpy.types.Object, timeline: dict[str, Any]) -> None:
-        obj.parent = parent_obj
-        self._apply_inherit(obj, timeline)
-
-    def _attach_children(self, parent_timeline: dict[str, Any], parent_obj: bpy.types.Object,
-                         collection: bpy.types.Collection) -> None:
-        for child in scenemath.attached_children(self.project, str(parent_timeline.get("id"))):
-            child_type = str(child.get("type", "")).lower()
-            category = TYPE_CATEGORY.get(child_type) or "helpers"
-            # Folders are structure: never filtered, or their contents would vanish.
-            if child_type != "folder" and category not in self.options.categories:
-                self.report.skipped[category] += 1
-                continue
-            label = child.get("name") or child_type or child.get("id")
-            try:
-                obj = self._import_attached(child, child_type, category, parent_timeline, parent_obj, collection)
-            except Exception as exc:
-                self.report.fallbacks.append(f"{label}: {type(exc).__name__}: {exc}")
-                obj = _placeholder(str(label), str(exc), collection, self.project, child, self.report)
-                self._parent_to(obj, parent_obj, child)
-            if obj is None:
-                continue
-            self.timeline_objects[str(child.get("id"))] = obj
-            self.report.created[f"attached_{child_type}"] += 1
-            if child_type not in MODEL_TYPES:  # models attach their own children
-                self._attach_children(child, obj, collection)
-
-    def _child_prefix(self, parent_timeline: dict[str, Any], parent_obj: bpy.types.Object, child: dict[str, Any]) -> Matrix | None:
-        """Matrices tl_update_matrix puts between a parent and a child's own transform.
-
-        * lock_bend child of a bendable bodypart: the parent's bend matrix,
-          T(pivot) @ R(bend), applied even at angle 0 (such children are authored
-          relative to the bend pivot).
-        * pivot: the child uses parent.matrix unless inherit.rot_point is set.
-        """
-        parent_type = str(parent_timeline.get("type", "")).lower()
-        prefix: Matrix | None = None
-        if parent_type == "bodypart" and bool(child.get("lock_bend", True)):
-            raw = parent_obj.get("mi_bend_definition")
-            definition = None
-            if raw:
-                try:
-                    definition = json.loads(raw)
-                except (TypeError, json.JSONDecodeError):
-                    definition = None
-            if isinstance(definition, dict):
-                spec = modelgeom.BendSpec.from_definition(definition, core.MI_UNITS_PER_BLOCK)
-                angles = spec.engine_angles(core.frame0_state(parent_timeline))
-                prefix = Matrix(scenemath.lock_bend_matrix(spec, angles))
-        pivot = scenemath.rot_point_prefix(parent_type, parent_timeline, scenemath.Inherit.of(child).rot_point)
-        if pivot is not None:
-            pivot_matrix = Matrix(pivot)
-            prefix = pivot_matrix if prefix is None else prefix @ pivot_matrix
-        return prefix
-
-    def _import_attached(self, timeline: dict[str, Any], kind: str, category: str, parent_timeline: dict[str, Any],
-                         parent_obj: bpy.types.Object, collection: bpy.types.Collection) -> bpy.types.Object | None:
-        prefix = self._child_prefix(parent_timeline, parent_obj, timeline)
-        if kind in MODEL_TYPES:
-            return self._import_model(timeline, self.project.template_for_timeline(timeline), collection, parent_obj=parent_obj, local_prefix=prefix)
-        if kind in shapegen.SHAPE_KINDS:
-            obj = self._import_shape(timeline, kind, collection)
-        elif kind == "folder":
-            obj = self._import_folder(timeline, collection)
-        else:
-            obj = self._import_root(timeline, category)
-        if obj is None:
-            return None
-        if prefix is not None:
-            obj.matrix_basis = prefix @ obj.matrix_basis
-        self._parent_to(obj, parent_obj, timeline)
-        self._apply_visibility(obj, self._style(timeline))
-        return obj
-
-    def _import_folder(self, timeline: dict[str, Any], collection: bpy.types.Collection) -> bpy.types.Object:
-        obj = _new_empty(timeline.get("name") or "Folder", collection)
-        _apply_transform(obj, core.frame0_state(timeline))
-        _metadata(obj, self.project, timeline)
-        self.report.created["folder"] += 1
-        return obj
-
-    # -- primitive shapes ----------------------------------------------------
-
-    def _shape_mesh(self, params: "shapegen.ShapeParams") -> bpy.types.Mesh:
-        cache = self.__dict__.setdefault("_shape_mesh_cache", {})
-        mesh = cache.get(params)
-        if mesh is not None:
-            return mesh
-        data = shapegen.build_shape(params)
-        mesh = bpy.data.meshes.new(f"MI {params.kind.title()} d{params.detail}")
-        mesh.from_pydata(data.vertices, [], data.faces)
-        uv_layer = mesh.uv_layers.new(name="UVMap")
-        uv_layer.data.foreach_set("uv", [component for uv in data.loop_uvs for component in uv])
-        mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
-        try:  # keep the generator's own normals (flat caps, smooth sides)
-            if hasattr(mesh, "use_auto_smooth"):
-                mesh.use_auto_smooth = True  # Blender < 4.1 only
-            mesh.normals_split_custom_set([tuple(normal) for normal in data.loop_normals])
-        except Exception:
-            pass
-        mesh.update()
-        mesh.materials.append(None)  # one slot; each object links its own material
-        cache[params] = mesh
-        self.report.created["shape_mesh"] += 1
-        return mesh
-
-    def _shape_texture(self, timeline: dict[str, Any], template: dict[str, Any] | None, state: dict[str, Any], name: str) -> Path | None:
-        override = state.get("TEXTURE_OBJ")
-        if isinstance(override, str) and override.lower() == "none":  # explicit "no texture"
-            return None
-        resource = self.project.resource(override)
-        if resource is None and template:
-            resource = self.project.resource((template.get("shape") or {}).get("tex"))
-        if resource is None:
-            return None
-        path = core.project_resource_path(self.project, resource)
-        if path is None:
-            seen = self.__dict__.setdefault("_missing_shape_textures", set())
-            filename = str(resource.get("filename") or resource.get("id"))
-            if filename not in seen:
-                seen.add(filename)
-                self.report.missing.append(f"{name}: shape texture {filename} not found next to the project")
-        return path
-
-    def _shape_material(self, kind: str, texture: Path | None, style: "scenemath.Style", blur: bool, backfaces: bool) -> bpy.types.Material:
-        key = (str(texture) if texture else None, style.key(), bool(blur), bool(backfaces), kind == "surface")
-        cache = self.__dict__.setdefault("_shape_material_cache", {})
-        material = cache.get(key)
-        if material is not None:
-            return material
-        tint = scenemath.color_linear(style.rgb_mul)
-        mix_lin = scenemath.color_linear(style.mix_color)
-        if texture:
-            base = (1.0, 1.0, 1.0, style.alpha)
-        else:  # no texture: bake tint and mix straight into the (linear) colour
-            p = style.mix_percent
-            base = tuple(c * (1 - p) + m * p for c, m in zip(tint, mix_lin)) + (style.alpha,)
-        material = _new_material(f"MI {kind.title()}", texture, base)
-        tex_node = next((node for node in material.node_tree.nodes if node.type == "TEX_IMAGE"), None)
-        if tex_node is not None:
-            tex_node.interpolation = "Linear" if blur else "Closest"
-            _apply_color_nodes(material, tint, mix_lin, style.mix_percent)
-        material.use_backface_culling = not backfaces
-        cache[key] = material
-        return material
-
-    def _import_shape(self, timeline: dict[str, Any], kind: str, collection: bpy.types.Collection) -> bpy.types.Object:
-        template = self.project.template_for_timeline(timeline)
-        params = shapegen.ShapeParams.from_template(kind, (template or {}).get("shape"))
-        name = timeline.get("name") or kind.title()
-        state = core.frame0_state(timeline)
-        style = self._style(timeline)
-        mesh = self._shape_mesh(params)
-        obj = bpy.data.objects.new(name, mesh)
-        collection.objects.link(obj)
-        texture = self._shape_texture(timeline, template, state, str(name))
-        material = self._shape_material(kind, texture, style, bool(timeline.get("texture_blur", False)), bool(timeline.get("backfaces", False)))
-        try:
-            slot = obj.material_slots[0]
-            slot.link = "OBJECT"
-            slot.material = material
-        except Exception:  # fall back to a private mesh copy carrying the material
-            obj.data = mesh.copy()
-            obj.data.materials[0] = material
-        pivot = scenemath.pivot_of(timeline, kind)
-        obj.matrix_basis = Matrix(scenemath.shape_local_matrix(state, pivot))
-        self._apply_visibility(obj, style)
-        _metadata(obj, self.project, timeline, template)
-        obj["mi_shape_kind"] = kind
-        self.report.created[kind] += 1
-        return obj
-
-    def _descendants(self, timeline_id: str) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        pending = list(self.project.children(timeline_id))
+# Mine-imator cameras look along their local +Y (engine space), which is -Y after the engine->Blender
+# reflection, with +Z up. Blender cameras look along -Z with +Y up, so this fixed rotation (applied on
+# the right of the camera's world matrix) re-aims the Blender camera. It reproduces the Suite's original
+# yaw/pitch aim exactly and additionally honours roll and parenting.
+CAMERA_FIX = Matrix((
+    (-1.0, 0.0, 0.0, 0.0),
+    (0.0, 0.0, 1.0, 0.0),
+    (0.0, 1.0, 0.0, 0.0),
+    (0.0, 0.0, 0.0, 1.0),
+))
+
+
+class SuiteExtras:
+    """Hooks called by ``mi_builder.Importer`` for the timeline types the importer core does not build."""
+
+    LIGHTS = ("pointlight", "spotlight")
+    TYPES = ("camera", "pointlight", "spotlight", "scenery", "path", "pathpoint", "particles")
+
+    def __init__(self, owner: "SceneImporter"):
+        self.owner = owner
+        self._raw: dict[str, dict[str, Any]] | None = None
+        self._paths: list[tuple[Any, bpy.types.Object]] = []
+
+    # -- hooks ---------------------------------------------------------------------------
+
+    def handles(self, timeline_type: str) -> bool:
+        return timeline_type in self.TYPES
+
+    def make_data(self, imp: mi_builder.Importer, tl: Any, st: Any, name: str) -> Any:
+        if tl.type in self.LIGHTS:
+            return self._light_data(imp, tl, st, name)
+        if tl.type == "camera":
+            return self._camera_data(st, name)
+        return None   # scenery, paths and particles are empties that finish() fills in
+
+    def fix_for(self, imp: mi_builder.Importer, tl: Any) -> tuple[Matrix | None, bool]:
+        if tl.type == "camera":
+            return CAMERA_FIX, True
+        if tl.type in self.LIGHTS:
+            return None, True
+        return None, False
+
+    def finish(self, imp: mi_builder.Importer, tl: Any, st: Any, obj: bpy.types.Object) -> None:
+        report = self.owner.report
+        if tl.type == "camera":
+            self.owner.context.scene.camera = obj
+            report.created["camera"] += 1
+        elif tl.type in self.LIGHTS:
+            report.created["light"] += 1
+        elif tl.type == "path":
+            self._paths.append((tl, obj))
+        elif tl.type == "pathpoint":
+            obj.empty_display_type = "SPHERE"
+        elif tl.type == "particles":
+            obj.empty_display_type = "SPHERE"
+            obj.name = f"Particle Spawner - {obj.name}"
+            obj["mi_placeholder_reason"] = "particle simulation is not converted"
+            report.placeholders.append(f"{obj.name}: particle simulation is not converted")
+            report.created["placeholder"] += 1
+        elif tl.type == "scenery":
+            self._scenery(imp, tl, obj)
+
+    def finalize(self, imp: mi_builder.Importer) -> None:
+        for tl, root in self._paths:
+            self._build_path(imp, tl, root)
+        for tid, obj in imp.objects.items():
+            tl = imp.project.timelines.get(tid)
+            if tl is not None:
+                _tag(obj, imp.project.path, tl)
+
+    # -- helpers -------------------------------------------------------------------------
+
+    def _raw_timeline(self, imp: mi_builder.Importer, tl: Any) -> dict[str, Any]:
+        if self._raw is None:
+            self._raw = {}
+            for item in imp.project.root.get("timelines") or []:
+                if isinstance(item, dict):
+                    self._raw[mi_data.save_id(item.get("id")) or ""] = item
+        return self._raw.get(tl.id, {})
+
+    def _collection(self, category: str) -> bpy.types.Collection:
+        return self.owner.collections.get(category) or self.owner.root_collection
+
+    def _light_data(self, imp: mi_builder.Importer, tl: Any, st: Any, name: str) -> bpy.types.Light:
+        values = st.values
+        is_spot = tl.type == "spotlight"
+        data = bpy.data.lights.new(name or ("Spot Light" if is_spot else "Point Light"), "SPOT" if is_spot else "POINT")
+        color = values.get("LIGHT_COLOR") or (1.0, 1.0, 1.0)
+        data.color = tuple(color)[:3]
+        strength = max(0.0, float(values.get("LIGHT_STRENGTH", 1.0) or 0.0))
+        light_range = max(0.01, float(values.get("LIGHT_RANGE", 250.0) or 250.0) / core.MI_UNITS_PER_BLOCK)
+        data.energy = strength * max(25.0, light_range * light_range * 10.0)
+        data.cutoff_distance = light_range
+        data.use_shadow = bool(self._raw_timeline(imp, tl).get("shadows", True))
+        data.specular_factor = float(values.get("LIGHT_SPECULAR_STRENGTH", 1.0) or 0.0)
+        data.shadow_soft_size = max(0.0, float(values.get("LIGHT_FADE_SIZE", 0.0) or 0.0) / core.MI_UNITS_PER_BLOCK)
+        if is_spot:
+            data.spot_size = min(math.pi, math.radians(float(values.get("LIGHT_SPOT_RADIUS", 50.0) or 50.0) * 2.0))
+            sharpness = values.get("LIGHT_SPOT_SHARPNESS")
+            data.spot_blend = 0.15 if sharpness is None else min(1.0, max(0.0, 1.0 - float(sharpness)))
+        return data
+
+    def _camera_data(self, st: Any, name: str) -> bpy.types.Camera:
+        values = st.values
+        data = bpy.data.cameras.new(name or "Mine-imator Camera")
+        fov = math.radians(float(values.get("CAM_FOV", 45.0) or 45.0))
+        # Mine-imator stores a vertical FOV; Blender's generic `angle` setter is horizontal under the
+        # default sensor fit.
+        data.sensor_fit = "VERTICAL"
+        data.lens = data.sensor_height / (2.0 * math.tan(max(0.001, min(fov, math.radians(170.0))) / 2.0))
+        if values.get("CAM_DOF"):
+            data.dof.use_dof = True
+            if values.get("CAM_DOF_DEPTH") is not None:
+                data.dof.focus_distance = max(0.01, float(values["CAM_DOF_DEPTH"]) / core.MI_UNITS_PER_BLOCK)
+        return data
+
+    def _descendants(self, tl: Any) -> list[Any]:
+        result: list[Any] = []
+        pending = list(tl.children)
         while pending:
             item = pending.pop(0)
             result.append(item)
-            pending.extend(self.project.children(str(item.get("id"))))
+            pending.extend(item.children)
         return result
 
-    def _import_item(self, timeline: dict[str, Any], template: dict[str, Any] | None, collection: bpy.types.Collection) -> bpy.types.Object:
-        state = core.frame0_state(timeline)
-        item = dict((template or {}).get("item", {}))
-        if self.options.honor_item_keyframe_changes:
-            changed = state.get("ITEM") or state.get("ITEM_NAME")
-            if isinstance(changed, str):
-                item["name"] = changed
-        name = str(item.get("name") or timeline.get("name") or "Item")
-        texture = _resolve_texture(item.get("tex"), None, self.project, self.assets)
-        if not texture and self.assets:
-            texture = self.assets.materialize(f"textures/{name}.png")
-        if not texture:
-            texture = _mcprep_texture(name)
-        if not texture:
-            self.report.missing.append(f"{name}: item texture not found")
-            return _placeholder(name, "item texture not found", collection, self.project, timeline, self.report)
-        obj = _pixel_item(
-            timeline.get("name") or Path(name).name,
-            texture,
-            collection,
-            self.report,
-            timeline.get("rot_point", (8.0, 0.0, 0.5)),
-        )
-        _apply_transform(obj, state)
-        _metadata(obj, self.project, timeline, template, texture)
-        return obj
+    def _build_path(self, imp: mi_builder.Importer, tl: Any, root: bpy.types.Object) -> None:
+        report = self.owner.report
+        points = [p for p in self._descendants(tl) if p.type == "pathpoint" and p.id in imp.base_world]
+        report.created["path"] += 1
+        if len(points) < 2:
+            root["mi_path_note"] = "Path has fewer than two visible points"
+            return
+        inverse = imp.base_world[tl.id].inverted_safe()
+        curve = bpy.data.curves.new(f"{root.name} Geometry", "CURVE")
+        curve.dimensions = "3D"
+        curve.bevel_depth = 0.025
+        curve.bevel_resolution = 1
+        spline = curve.splines.new("POLY")
+        spline.points.add(len(points) - 1)
+        for index, point in enumerate(points):
+            coordinate = (inverse @ imp.base_world[point.id]).to_translation()
+            spline.points[index].co = (*coordinate, 1.0)
+        obj = bpy.data.objects.new(curve.name, curve)
+        self._collection("helpers").objects.link(obj)
+        obj.parent = root     # identity basis + identity parent inverse: points are in the path's local space
+        curve.materials.append(_new_material("MI Path", color=(0.2, 0.8, 1.0, 1.0)))
 
-    def _import_block(self, timeline: dict[str, Any], template: dict[str, Any] | None, collection: bpy.types.Collection) -> bpy.types.Object:
-        name = str(((template or {}).get("block") or {}).get("name") or timeline.get("name") or "Block")
-        bpy.ops.mesh.primitive_cube_add(size=1.0)
-        obj = self.context.active_object
-        obj.name = name
-        _link_object(obj, collection)
-        clean_name = name.replace("minecraft:", "").removeprefix("block/")
-        texture = self.assets.materialize(f"textures/block/{clean_name}.png") if self.assets else None
-        if not texture:
-            texture = _mcprep_texture(f"block/{clean_name}")
-        obj.data.materials.append(_new_material(f"MI Block {name}", texture))
-        _apply_transform(obj, core.frame0_state(timeline))
-        _metadata(obj, self.project, timeline, template, texture)
-        self.report.created["block"] += 1
-        return obj
+    # -- world scenery ---------------------------------------------------------------------
 
-    def _import_light(self, timeline: dict[str, Any], collection: bpy.types.Collection) -> bpy.types.Object:
-        state = core.frame0_state(timeline)
-        is_spot = str(timeline.get("type", "")).lower() in {"spotlight", "spot_light"}
-        data = bpy.data.lights.new(timeline.get("name") or ("Spot Light" if is_spot else "Point Light"), "SPOT" if is_spot else "POINT")
-        color = _hex_color(state.get("LIGHT_COLOR"))
-        data.color = color[:3]
-        strength = max(0.0, float(state.get("LIGHT_STRENGTH", 1.0)))
-        light_range = max(0.01, float(state.get("LIGHT_RANGE", 16.0)) / core.MI_UNITS_PER_BLOCK)
-        data.energy = strength * max(25.0, light_range * light_range * 10.0)
-        data.cutoff_distance = light_range
-        data.use_shadow = bool(timeline.get("shadows", True))
-        data.specular_factor = float(state.get("LIGHT_SPECULAR_STRENGTH", 1.0))
-        data.shadow_soft_size = max(0.0, float(state.get("LIGHT_FADE_SIZE", 0.0)) / core.MI_UNITS_PER_BLOCK)
-        if is_spot:
-            data.spot_size = math.radians(float(state.get("SPOT_RADIUS", state.get("LIGHT_SPOT_RADIUS", 45.0))) * 2.0)
-            data.spot_blend = min(1.0, max(0.0, float(state.get("SPOT_FADE", 0.15))))
-        obj = bpy.data.objects.new(data.name, data)
-        collection.objects.link(obj)
-        _apply_transform(obj, state)
-        _metadata(obj, self.project, timeline)
-        self.report.created["light"] += 1
-        return obj
-
-    def _import_camera(self, timeline: dict[str, Any], collection: bpy.types.Collection) -> bpy.types.Object:
-        state = core.frame0_state(timeline)
-        data = bpy.data.cameras.new(timeline.get("name") or "Mine-imator Camera")
-        fov = math.radians(float(state.get("CAMERA_FOV", state.get("FOV", 70.0))))
-        # Mine-imator stores a vertical FOV; Blender's generic `angle` setter
-        # is horizontal under the default sensor fit.
-        data.sensor_fit = "VERTICAL"
-        data.lens = data.sensor_height / (2.0 * math.tan(max(0.001, fov) / 2.0))
-        data.dof.use_dof = bool(state.get("DOF", False))
-        obj = bpy.data.objects.new(data.name, data)
-        collection.objects.link(obj)
-        _apply_transform(obj, state)
-        yaw = math.radians(float(state.get("ROT_Z", 0.0)))
-        pitch = math.radians(float(state.get("ROT_X", 0.0)))
-        direction = Vector((
-            math.cos(pitch) * math.sin(yaw),
-            -math.cos(pitch) * math.cos(yaw),
-            -math.sin(pitch),
-        ))
-        if direction.length_squared > 0:
-            obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
-        _metadata(obj, self.project, timeline)
-        self.context.scene.camera = obj
-        self.report.created["camera"] += 1
-        return obj
-
-    def _import_scenery(self, timeline: dict[str, Any], template: dict[str, Any] | None, collection: bpy.types.Collection) -> bpy.types.Object:
-        resource = self.project.resource((template or {}).get("scenery"))
-        if not resource:
-            # Mine-imator creates an empty scenery slot for a new project.  It
-            # has no visible geometry, so a rendered missing-resource cube is
-            # misleading (and showed up as the reported random white block).
-            root = _new_empty(timeline.get("name") or "Empty World Scenery", collection, "PLAIN_AXES")
-            _apply_transform(root, core.frame0_state(timeline))
-            _metadata(root, self.project, timeline, template)
+    def _scenery(self, imp: mi_builder.Importer, tl: Any, root: bpy.types.Object) -> None:
+        owner = self.owner
+        report = owner.report
+        project_path = Path(imp.project.path)
+        template = imp.project.templates.get(tl.temp)
+        resource = imp.project.resource(template.scenery) if template is not None else None
+        collection = self._collection("scenery")
+        if resource is None:
+            # Mine-imator creates an empty scenery slot for a new project. It has no visible geometry, so
+            # a rendered missing-resource cube is misleading. Keep the slot for source accounting only.
             root["mi_scenery_note"] = "No scenery resource is assigned; nothing visible to import"
-            # Keep the empty slot for source accounting and metadata, but make
-            # it completely unobtrusive. A CUBE display looked like imported
-            # white geometry in solid/material-preview mode.
             root.empty_display_size = 0.05
             root.show_name = False
             root.hide_viewport = True
             root.hide_render = True
-            self.report.notes.append(f"{root.name}: empty scenery slot contains no visible world geometry")
-            self.report.created["empty_scenery"] += 1
-            return root
-        raw_bounds = {"start": resource.get("world_box_start"), "end": resource.get("world_box_end")}
-        bounds = core.world_bounds(raw_bounds)
-        region_dir = Path(str(resource.get("world_regions_dir", "")))
+            report.notes.append(f"{root.name}: empty scenery slot contains no visible world geometry")
+            report.created["empty_scenery"] += 1
+            return
+        data = resource.data
+        bounds = core.world_bounds({"start": data.get("world_box_start"), "end": data.get("world_box_end")})
+        region_dir = Path(str(data.get("world_regions_dir", "")))
         world_dir = region_dir.parent
-        cache_path = meshcache.discover(self.project.path, str(resource.get("filename", "")))
-        world_name = timeline.get("name") or resource.get("filename") or "World Scenery"
-        mineways = core.find_mineways(self.options.mineways_path)
-        if (not mineways or not bounds or not region_dir.is_dir() or not world_dir.is_dir()) and cache_path and self.assets:
-            return _import_meshcache_world(
-                cache_path,
-                world_name,
-                timeline,
-                template,
-                collection,
-                self.project,
-                self.assets,
-                self.report,
-            )
+        cache_path = meshcache.discover(project_path, str(resource.filename))
+        world_name = tl.name or resource.filename or "World Scenery"
+        mineways = core.find_mineways(owner.options.mineways_path)
+        world_ok = bool(bounds) and region_dir.is_dir() and world_dir.is_dir()
+        if (not mineways or not world_ok) and cache_path and owner.assets:
+            _import_meshcache_world(cache_path, world_name, root, tl, template, collection, project_path, owner.assets, report)
+            return
         if not mineways:
             details = "Mineways is not configured and no matching Mine-imator meshcache was found"
             if bounds:
-                details += f"; export X/Y/Z {bounds[0]} to {bounds[1]} from {resource.get('world_regions_dir', '')}"
-            return _placeholder(world_name, details, collection, self.project, timeline, self.report)
-        if not bounds or not region_dir.is_dir() or not world_dir.is_dir():
+                details += f"; export X/Y/Z {bounds[0]} to {bounds[1]} from {data.get('world_regions_dir', '')}"
+            self._placeholder(root, world_name, details)
+            return
+        if not world_ok:
             details = "saved world path or crop is invalid and no matching Mine-imator meshcache was found"
-            if cache_path and not self.assets:
+            if cache_path and not owner.assets:
                 details = f"meshcache found at {cache_path}, but the matching Mine-imator asset pack is unavailable"
-            return _placeholder(world_name, details, collection, self.project, timeline, self.report)
+            self._placeholder(root, world_name, details)
+            return
         export_dir = Path(tempfile.gettempdir()) / "mineimator_mcprep_bridge" / "mineways"
         export_dir.mkdir(parents=True, exist_ok=True)
-        stem = core.safe_filename(f"{self.project.path.stem}-{timeline.get('id', 'scenery')}")
+        stem = core.safe_filename(f"{project_path.stem}-{tl.id or 'scenery'}")
         obj_path = export_dir / f"{stem}.obj"
         script_path = export_dir / f"{stem}.mwscript"
         log_path = export_dir / f"{stem}.log"
@@ -1996,14 +745,11 @@ class SceneImporter:
         imported = [obj for obj in bpy.data.objects if obj not in before]
         if not imported:
             raise RuntimeError("Mineways exported an OBJ but Blender imported no objects")
-        root = _new_empty(timeline.get("name") or resource.get("filename") or "World Scenery", collection)
-        _apply_transform(root, core.frame0_state(timeline))
-        _metadata(root, self.project, timeline, template, obj_path)
+        _tag(root, project_path, tl, obj_path)
         root["mi_world_region_dir"] = str(region_dir)
         root["mi_world_bounds_xyz"] = json.dumps(bounds)
-        # Mine-imator's world builder maps Minecraft Z->engine X and
-        # Minecraft X->engine Y. Blender's OBJ importer instead produces
-        # (world X, -world Z, world Y), so transpose the horizontal axes into
+        # Mine-imator's world builder maps Minecraft Z->engine X and Minecraft X->engine Y. Blender's OBJ
+        # importer instead produces (world X, -world Z, world Y), so transpose the horizontal axes into
         # Mine-imator's (world Z, -world X, world Y) local basis.
         world_basis = Matrix((
             (0.0, -1.0, 0.0, 0.0),
@@ -2020,68 +766,204 @@ class SceneImporter:
                     for node in material.node_tree.nodes:
                         if node.type == "TEX_IMAGE":
                             node.interpolation = "Closest"
-            self.report.created["scenery_mesh"] += 1
-        self.report.notes.append(f"Mineways export: {obj_path}")
-        return root
+            report.created["scenery_mesh"] += 1
+        report.notes.append(f"Mineways export: {obj_path}")
 
-    def _import_text(self, timeline: dict[str, Any], template: dict[str, Any] | None, collection: bpy.types.Collection) -> bpy.types.Object:
-        state = core.frame0_state(timeline)
-        curve = bpy.data.curves.new(timeline.get("name") or "Mine-imator Text", type="FONT")
-        curve.body = str(state.get("TEXT", (template or {}).get("text", "Text")))
-        curve.align_x = "CENTER"
-        obj = bpy.data.objects.new(curve.name, curve)
-        collection.objects.link(obj)
-        _apply_transform(obj, state)
-        _metadata(obj, self.project, timeline, template)
-        self.report.created["text"] += 1
-        return obj
+    def _placeholder(self, root: bpy.types.Object, name: str, message: str) -> None:
+        # The root empty keeps the hierarchy and transform for whatever hangs off a missing resource,
+        # and draws nothing.
+        root["mi_placeholder_reason"] = message
+        root.name = f"MISSING - {name}"
+        self.owner.report.placeholders.append(f"{name}: {message}")
+        self.owner.report.created["placeholder"] += 1
 
-    def _import_path(self, timeline: dict[str, Any], collection: bpy.types.Collection) -> bpy.types.Object:
-        points = [item for item in self._descendants(str(timeline.get("id"))) if str(item.get("type", "")).lower() in {"path_point", "pathpoint"}]
-        root = _new_empty(timeline.get("name") or "Mine-imator Path", collection)
-        _apply_transform(root, core.frame0_state(timeline))
-        _metadata(root, self.project, timeline)
-        if len(points) < 2:
-            root["mi_path_note"] = "Path has fewer than two visible points"
-            self.report.created["path"] += 1
-            return root
-        curve = bpy.data.curves.new(f"{root.name} Geometry", "CURVE")
-        curve.dimensions = "3D"
-        curve.bevel_depth = 0.025
-        curve.bevel_resolution = 1
-        spline = curve.splines.new("POLY")
-        spline.points.add(len(points) - 1)
-        for index, point in enumerate(points):
-            coordinate = core.mi_position(core.frame0_state(point))
-            spline.points[index].co = (*coordinate, 1.0)
-            handle = _new_empty(point.get("name") or f"Path Point {index + 1}", collection, "SPHERE")
-            handle.location = coordinate
-            handle.parent = root
-            _metadata(handle, self.project, point)
-            self.timeline_objects[str(point.get("id"))] = handle
-        obj = bpy.data.objects.new(curve.name, curve)
-        collection.objects.link(obj)
-        obj.parent = root
-        curve.materials.append(_new_material("MI Path", color=(0.2, 0.8, 1.0, 1.0)))
-        self.report.created["path"] += 1
-        return root
 
-    def _apply_parenting(self) -> None:
-        for timeline_id, obj in list(self.timeline_objects.items()):
-            timeline = self.project.timeline(timeline_id)
-            if not timeline or str(timeline.get("type", "")).lower() == "bodypart":
-                continue
-            parent_id = str(timeline.get("parent", "root"))
-            parent = self.timeline_objects.get(parent_id)
-            if parent and obj.parent is None:
-                # Timeline transforms are stored relative to their Mine-imator
-                # parent. Keep matrix_basis unchanged so held items and nested
-                # entities follow the posed body part instead of retaining the
-                # temporary world transform they had before hierarchy linking.
-                obj.parent = parent
+class SceneImporter:
+    """Imports one project/object/model: Suite collections + Importer core + Suite extras + environment."""
+
+    def __init__(self, context: bpy.types.Context, path: str | os.PathLike[str], options: ImportOptions):
+        self.context = context
+        self.path = resolve_import_path(path)
+        self.options = options
+        self.report = ImportReport(project_path=str(self.path))
+        self.assets: core.AssetStore | None = None
+        self.root_collection: bpy.types.Collection | None = None
+        self.collections: dict[str, bpy.types.Collection] = {}
+        self.project: core.ProjectIndex | None = None   # Suite view of the project (environment, format 33+)
+        self.importer: mi_builder.Importer | None = None
+
+    # -- Suite project view ------------------------------------------------------------------
+
+    def load_suite_project(self) -> None:
+        """The Suite environment needs the raw project index; it only exists for .miproject 2.0+."""
+        if self.path.suffix.lower() != ".miproject":
+            return
+        try:
+            data = core.load_json(self.path)
+            fmt = int(data.get("format", -1))
+        except (core.BridgeError, TypeError, ValueError) as exc:
+            self.report.fallbacks.append(f"Suite environment unavailable: {exc}")
+            return
+        if fmt < 33:
+            self.report.notes.append(
+                f"Project format {fmt}: the Mine-imator Suite environment needs a 2.0+ project (format 33+); "
+                "geometry was imported normally"
+            )
+            return
+        self.project = core.ProjectIndex(self.path, data)
+        if fmt != core.SUPPORTED_FORMAT:
+            self.report.notes.append(f"Project format {fmt}: the Suite environment is tuned for format {core.SUPPORTED_FORMAT}")
+
+    def prepare_assets(self) -> None:
+        install = core.find_mineimator_install(self.path, self.options.mineimator_path)
+        asset_path = Path(self.options.asset_pack_path) if self.options.asset_pack_path else None
+        if asset_path and asset_path.is_file() and asset_path.suffix.lower() == ".zip":
+            metadata_path = asset_path.with_suffix(".midata")
+            if metadata_path.is_file():
+                try:
+                    base = install or asset_path.parent
+                    self.assets = core.AssetStore.open_paths(base, asset_path.stem, metadata_path, asset_path)
+                    self.report.notes.append(f"Mine-imator assets: {self.assets.asset_version} ({self.assets.zip_path})")
+                    return
+                except core.BridgeError as exc:
+                    self.report.missing.append(str(exc))
+        if not install:
+            self.report.missing.append("Mine-imator installation not found; bundled characters and special blocks will use placeholders")
+            return
+        try:
+            self.assets = core.AssetStore.open(install)
+            self.report.notes.append(f"Mine-imator assets: {self.assets.asset_version} ({self.assets.zip_path})")
+        except core.BridgeError as exc:
+            self.report.missing.append(str(exc))
+
+
+    def mineimator_dir(self) -> str:
+        install = core.find_mineimator_install(self.path, self.options.mineimator_path)
+        if install:
+            return str(install)
+        asset = Path(self.options.asset_pack_path) if self.options.asset_pack_path else None
+        if asset and asset.is_file():
+            return str(asset.parent.parent.parent)      # <install>/Data/Minecraft/<version>.zip
+        return self.options.mineimator_path or ""
+
+    def create_collections(self) -> None:
+        name_source = self.importer.project.name if self.importer else self.path.stem
+        base = f"Mine-imator - {name_source}"
+        name = core.unique_name(base, bpy.data.collections.keys())
+        self.root_collection = bpy.data.collections.new(name)
+        self.context.scene.collection.children.link(self.root_collection)
+        self.root_collection["mi_bridge_version"] = core.ADDON_VERSION
+        self.root_collection["mi_source_project"] = str(self.path)
+        self.root_collection["mi_created_in"] = self.importer.project.created_in if self.importer else ""
+        self.root_collection["mi_3d_outer_layers"] = self.options.outer_layers_3d
+        self.context.scene["mi_bridge_last_import_collection"] = name
+        self.report.collection_name = name
+        for key, label in CATEGORY_NAMES.items():
+            if key in self.options.categories:
+                child = bpy.data.collections.new(label)
+                self.root_collection.children.link(child)
+                self.collections[key] = child
+
+    def import_scene(self) -> ImportReport:
+        options = self.options
+        self.load_suite_project()
+        self.prepare_assets()
+        if options.outer_layers_3d:
+            self.report.notes.append("3D character outer layers: enabled for player-skin hats, jackets, sleeves, and pants")
+        mi_options = mi_builder.Options(
+            version=options.version, mi_dir=self.mineimator_dir(), asset_zip=options.asset_pack_path,
+            frame=options.frame, animation=options.animation, anim_step=options.anim_step,
+            unit_scale=options.unit_scale, import_hidden=options.import_hidden,
+            pack_textures=options.pack_textures, merge_vertices=options.merge_vertices,
+            depth_masks=options.depth_masks, rig=options.rig, ik=options.ik, ik_keep_pose=options.ik_keep_pose,
+            bend_weights=options.bend_weights, standard_view=options.standard_view,
+            outer_layers_3d=options.outer_layers_3d, categories=set(options.categories),
+        )
+        extras = SuiteExtras(self)
+        # Parse and validate first, so a bad file fails before the scene is touched.
+        self.importer = mi_builder.Importer(str(self.path), mi_options, extras=extras)
+        if options.remove_startup_cube:
+            _remove_untouched_startup_cube(self.context, self.report)
+        self.create_collections()
+        mi_options.category_collections = self.collections
+        self.importer.run(self.context, collection=self.root_collection)
+        self._collect_report(self.importer)
+        self._audit_world_size()
+        self._environment()
+        self._mcprep_materials()
+        if not options.animation:
+            self._ensure_static()
+        if options.outer_layers_3d:
+            self.context.scene["mi_bridge_last_3d_outer_layer_count"] = int(self.report.created["3d_outer_layer"])
+        write_report(self.report)
+        return self.report
+
+    def _collect_report(self, imp: mi_builder.Importer) -> None:
+        report = self.report
+        report.animation_imported = bool(self.options.animation)
+        report.notes.append(f"Importer core: {imp.project.version_label} (format {imp.project.file_format})")
+        for timeline in imp.project.roots():
+            if timeline.type == "audio":
+                report.skipped["audio"] += 1
+            else:
+                report.imported[timeline.type] += 1
+        for kind, count in imp.stats.items():
+            if kind in ("3d_outer_layer", "3d_outer_polys"):
+                report.created[kind] += count
+            else:
+                report.created[f"object_{kind}"] += count
+        if imp.rigs:
+            report.created["armature_rig"] += len(imp.rigs)
+        for kind, count in imp.skipped.items():
+            report.skipped[kind or "unknown"] += count
+        for category, count in imp.skipped_category.items():
+            report.skipped[f"category:{category}"] += count
+        for message in imp.messages:
+            lowered = message.lower()
+            if message.startswith("Error"):
+                report.fallbacks.append(message)
+            elif message.startswith("Warning") or "not found" in lowered or "could not be loaded" in lowered:
+                report.missing.append(message)
+            else:
+                report.notes.append(message)
+        if self.options.outer_layers_3d and not imp.stats.get("3d_outer_layer"):
+            report.notes.append("3D outer layers were enabled but no player-skin outer layer was found in this import")
+
+    def _audit_world_size(self, max_blocks: float = 3.5, max_distance: float = 14.0) -> None:
+        """List meshes that end up unusually large or far from the origin.
+
+        The report names them (with their local scale), which is the quickest way to
+        pin down a misplaced shape without guessing.
+        """
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            return
+        flagged: list[str] = []
+        for collection in self.collections.values():
+            for obj in collection.all_objects:
+                if obj.type != "MESH" or len(obj.data.vertices) < 2:
+                    continue
+                corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+                lows = [min(c[i] for c in corners) for i in range(3)]
+                highs = [max(c[i] for c in corners) for i in range(3)]
+                size = max(highs[i] - lows[i] for i in range(3))
+                center = [(lows[i] + highs[i]) * 0.5 for i in range(3)]
+                if size > max_blocks or math.sqrt(sum(c * c for c in center)) > max_distance:
+                    scale = obj.matrix_basis.to_scale()
+                    flagged.append(
+                        f"audit: '{obj.name}' (parent '{obj.parent.name if obj.parent else '-'}') spans {size:.1f} blocks at "
+                        f"({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}), local scale ({scale[0]:.3f}, {scale[1]:.3f}, {scale[2]:.3f})"
+                    )
+        self.report.fallbacks.extend(flagged[:15])
+        if len(flagged) > 15:
+            self.report.fallbacks.append(f"audit: ... and {len(flagged) - 15} more oversized/far objects")
 
     def _environment(self) -> None:
         if "environment" not in self.options.categories:
+            return
+        if self.project is None:
+            self.report.notes.append("No Suite project index for this file type/format; environment import skipped")
             return
         if self.options.mineimator_suite:
             from . import suite_environment
@@ -2152,6 +1034,7 @@ class SceneImporter:
             self.report.created["ground"] += 1
         self.context.scene["mi_environment_source"] = json.dumps(background, separators=(",", ":"))[:60000]
 
+
     def _mcprep_materials(self) -> None:
         if not self.options.use_mcprep:
             return
@@ -2176,6 +1059,7 @@ class SceneImporter:
         except Exception as exc:
             self.report.fallbacks.append(f"MCprep material preparation skipped: {exc}")
 
+
     def _ensure_static(self) -> None:
         if not self.root_collection:
             return
@@ -2186,11 +1070,13 @@ class SceneImporter:
                 obj.data.animation_data_clear()
 
 
+
 def preflight(project_value: str, options: ImportOptions) -> ImportReport:
-    project = core.load_project(project_value)
-    report = ImportReport(project_path=str(project.path))
-    report.notes.append(f"Project format {project.data.get('format')}, created in Mine-imator {project.created_in}")
-    install = core.find_mineimator_install(project.path, options.mineimator_path)
+    path = resolve_import_path(project_value)
+    project = mi_data.Project(str(path), options.version)
+    report = ImportReport(project_path=str(path))
+    report.notes.append(f"{project.version_label}: project format {project.file_format}")
+    install = core.find_mineimator_install(path, options.mineimator_path)
     if install:
         try:
             store = core.AssetStore.open(install)
@@ -2198,21 +1084,24 @@ def preflight(project_value: str, options: ImportOptions) -> ImportReport:
         except core.BridgeError as exc:
             report.missing.append(str(exc))
     else:
-        report.missing.append("Mine-imator installation was not detected")
+        found = mi_assets.find_mineimator_dir(str(path), options.mineimator_path, options.version)
+        if found:
+            report.notes.append(f"Mine-imator resources found: {found}")
+        else:
+            report.missing.append("Mine-imator installation was not detected")
     mineways = core.find_mineways(options.mineways_path)
     if mineways:
         report.notes.append(f"Mineways found: {mineways}")
     else:
-        report.missing.append("Mineways is not configured; scenery will become labeled placeholders")
-    for timeline in project.root_timelines():
-        timeline_type = str(timeline.get("type", "unknown")).lower()
-        if timeline_type == "audio":
+        report.notes.append("Mineways is not configured; scenery uses a matching .meshcache when available, otherwise a placeholder")
+    for timeline in project.roots():
+        if timeline.type == "audio":
             report.skipped["audio"] += 1
         else:
-            report.imported[timeline_type] += 1
+            report.imported[timeline.type] += 1
     for resource in project.resources.values():
-        if resource.get("type") in {"skin", "downloadskin", "model", "texture"} and not core.project_resource_path(project, resource):
-            report.missing.append(f"Project resource missing: {resource.get('filename', resource.get('id'))}")
+        if resource.type in {"skin", "downloadskin", "downloadedskin", "model", "texture"} and not mi_assets.find_project_file(project.folder, resource.filename):
+            report.missing.append(f"Project resource missing: {resource.filename or resource.id}")
     return report
 
 

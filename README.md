@@ -1,33 +1,38 @@
-# Mine-imator Suite + Import for Blender 0.3.6
+# Mine-imator Suite + Import for Blender 0.4.0
 
-Imports the frame-zero static state of Mine-imator 2.0.2 format-34 projects
-into Blender 5.2. The add-on creates a new uniquely named collection on every
-import, keeps Mine-imator model parts as editable pivot/mesh hierarchies, and
-never creates F-curves or other animation data.
+The Mine-imator Suite (environment, world scenery, camera and lights, Render Export, MCprep) merged with the
+Mine-imator Importer core (by Alexandra). The importer core now builds all geometry; the Suite supplies
+everything around it.
+
+## What comes from where
+
+**Importer core (replaces the old Suite importing code):** characters, special blocks, custom `.mimodel`
+models, items, blocks, primitive shapes and text; armatures with exact bends; Mine-imator IK; depth masks;
+optional keyframe baking; `.miproject` (formats 1.1 to Vexel), `.miobject` and `.mimodel` files; drag and drop.
+
+**Suite (kept):** Mine-imator environment (sky, sun, moon, clouds, fog, biome, ground) with live sidebar
+controls, world scenery (Mineways or `.meshcache`), camera, lights, paths, particle placeholders, category
+collections and filters, 3D character outer layers, MCprep preparation, startup-cube cleanup, report,
+preflight and Render Export.
 
 ## Install and use
 
-1. In Blender, choose **Edit > Preferences > Get Extensions > Install from Disk**.
-2. Select `mineimator_mcprep_bridge-0.3.6.zip` and enable the extension.
-3. Open **File > Import > Mine-imator Project**, or the **MI Bridge** tab in the
-   3D View sidebar.
-4. Select a `.miproject` file (or paste a directory containing exactly one),
-   choose categories, run **Preflight**, then **Import Scene**.
-5. Read the full result in the Text Editor's `Mine-imator Bridge Report` text.
+1. **Edit > Preferences > Get Extensions > Install from Disk**, pick the zip, enable it.
+2. **File > Import > Mine-imator (.miproject/.miobject/.mimodel)**, or the **MI Bridge** sidebar tab.
+3. Use **Preflight** to validate, then **Import Scene**; read the *Mine-imator Bridge Report* text.
 
-Project-local files take priority over the matching Mine-imator Minecraft
-asset ZIP. MCprep material preparation is invoked when its operator is
-available, while image textures retain nearest-neighbor filtering and alpha.
+## Changes in 0.4.0
 
-Mineways is optional for the rest of the import. If configured or found in a
-common portable/install location, the bridge
-uses Mineways' headless scripting interface with the saved world path and the
-corrected X/Y/Z crop, imports the resulting OBJ, and includes it in MCprep
-material preparation. If Mineways is unavailable, world scenery becomes a
-magenta placeholder containing exact setup and crop information.
-
-Particle spawners become labeled placeholders. Audio and all keyframes after
-frame zero are intentionally ignored.
+- Importer core replaces the Suite's model, bend, item, block, shape and text builders. The removed modules are
+  `modelgeom.py`, `shapegen.py` and `scenemath.py`.
+- New sidebar section **Pose, Rigging and Animation**: frame, animation baking, armatures, weighted bends, IK,
+  depth masks, scale, packing and Standard view. Animation is off by default, so imports stay a single pose.
+- 3D outer layers were reimplemented on the new geometry path (`voxelize_block`), still one texel deep.
+- Cameras, lights and paths use the importer's evaluated transforms, so parenting, inheritance flags and roll
+  are honoured. Camera values use Mine-imator's real keys (`CAM_FOV`, `LIGHT_RANGE`, ...).
+- **Use frame-0 item swaps** was removed: the importer core applies custom item slots natively.
+- Importer messages and labels were translated to English (code comments remain Spanish).
+- The Suite environment needs a 2.0+ project (format 33+); older formats import geometry only.
 
 ## Render Export
 
