@@ -247,7 +247,7 @@ class MIBRIDGE_PG_settings(PropertyGroup):
     use_mcprep: BoolProperty(
         name="Run MCprep material preparation",
         description="Run MCprep's material preparation after geometry creation when MCprep is enabled",
-        default=True,
+        default=False,
     )
     mi_version: EnumProperty(
         name="Mine-imator version",
