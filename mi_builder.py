@@ -312,6 +312,10 @@ class MaterialLib:
             cur = mix('ADD', cur, add)
         if key.mix_pct > 0:
             cur = mix('MIX', cur, mixc, key.mix_pct)
+        if cur is not color_out and color_out is not None:
+            # Marks a texture that is tinted by Mine-imator's color. Post-import tools that rebuild the node
+            # tree (MCprep material preparation) would drop these nodes, so the Suite leaves such materials alone.
+            mat['mi_tinted'] = True
 
         if isinstance(cur, tuple):
             s_base.default_value = (cur[0], cur[1], cur[2], 1.0)

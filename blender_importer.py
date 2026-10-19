@@ -1042,6 +1042,14 @@ class SceneImporter:
             obj for obj in self.root_collection.all_objects
             if obj.type == "MESH" and not obj.get("mi_suite_id")
         ] if self.root_collection else []
+        # MCprep's material preparation rebuilds the node tree around the texture, which would discard the
+        # Multiply/Add/Mix nodes that reproduce Mine-imator's color on shapes and tinted parts.
+        tinted = [obj for obj in meshes if any(slot.material and slot.material.get("mi_tinted") for slot in obj.material_slots)]
+        if tinted:
+            meshes = [obj for obj in meshes if obj not in tinted]
+            self.report.notes.append(
+                f"MCprep material preparation skipped on {len(tinted)} colored objects to keep their Mine-imator color nodes"
+            )
         if not meshes:
             return
         try:
